@@ -43,7 +43,7 @@ eps_dec = 0.99
 # battery_capacities = [25, 100, 50, 37, 65]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65]
 
-num_agents = 10
+num_agents = 5
 battery_capacities = [
     25,     #
     100,    #
@@ -109,31 +109,33 @@ if __name__ == "__main__":
         seed
         )
     
-    trainer1.train()
+    #trainer1.train()
+    trainer1.evaluate()
 
-    seed = "fixed_summer"
+    # seed = "fixed_summer"
     
-    trainer1 = SB3_MAS_Train(
-        num_agents,
-        num_episodes,
-        irradiance_datapaths,
-        delta_time,
-        proc_interval,
-        proc_rate,
-        arrival_rate,
-        eps_init,
-        eps_fin,
-        eps_dec,
-        battery_capacities,
-        panel_surfaces,
-        power_idle,
-        power_max,
-        train_freq,
-        w,
-        mode,
-        batch_size,
-        smart_node,
-        seed
-        )
+    # trainer1 = SB3_MAS_Train(
+    #     num_agents,
+    #     num_episodes,
+    #     irradiance_datapaths,
+    #     delta_time,
+    #     proc_interval,
+    #     proc_rate,
+    #     arrival_rate,
+    #     eps_init,
+    #     eps_fin,
+    #     eps_dec,
+    #     battery_capacities,
+    #     panel_surfaces,
+    #     power_idle,
+    #     power_max,
+    #     train_freq,
+    #     w,
+    #     mode,
+    #     batch_size,
+    #     smart_node,
+    #     seed
+    #     )
     
-    trainer1.train()
+    #trainer1.train()
+    #trainer1.evaluate()

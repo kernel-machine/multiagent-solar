@@ -71,7 +71,8 @@ class CustomEnvironment(ParallelEnv):
         self.episode = 355
         self._w = w
         self.seed = seed
-        
+        self.total_frames_processed = 0
+
         try:
             self.max_steps = int(24 * 60 * 60 / proc_interval)
         except:
@@ -228,6 +229,7 @@ class CustomEnvironment(ParallelEnv):
         self.actions = [[0.0, 0, 0.0, 0.0] for i in range(0, self._num_agents)]
         self.battery_energies = [(self.battery_capacities[i] * self.states[i][0]) for i in range(0, self._num_agents)]
         self.backlogs = [0 for i in range(0, self._num_agents)]
+        self.total_frames_processed = 0
 
         self.fs = [0 for i in range(0, self._num_agents)]
         self.hs = [0 for i in range(0, self._num_agents)]
@@ -300,6 +302,7 @@ class CustomEnvironment(ParallelEnv):
             
             if actual_battery > needed_energy and processable > 0:
                 processed = min(processable, fti * self._proc_interval)
+                self.total_frames_processed += processed
                 backlog = max(backlog - processed, 0)
                 actual_battery = max(actual_battery - needed_energy, 0)
                 local_processing = processed / self._proc_interval
@@ -376,7 +379,9 @@ class CustomEnvironment(ParallelEnv):
             
             self.hs[agent_id] += offloading_processing
             self.battery_energies[agent_id] = min(actual_battery, self.battery_capacities[agent_id])
-        
+            if self.battery_energies[agent_id] <= 0:
+                self.backlogs[agent_id] = 0
+
         for agent_id in range(self._num_agents):
             self.states[agent_id][0] = round(self.battery_energies[agent_id] / self.battery_capacities[agent_id], 2)
             self.states[agent_id][1] = self.calculate_backlog_level(agent_id)
@@ -390,8 +395,9 @@ class CustomEnvironment(ParallelEnv):
 
         # updating backlogs with arriving frames for each agent
         for agent_id in range(0, self._num_agents):
-            frames_arrived = self._arrival_rate * self._proc_interval
-            self.backlogs[agent_id] += frames_arrived
+            if self.battery_energies[agent_id] > 0:
+                frames_arrived = self._arrival_rate * self._proc_interval
+                self.backlogs[agent_id] += frames_arrived
 
         # for each agent is returned the reward according the reward function defined a priori        
         rewards = {a: self.calculate_reward_locally(a) for a in self.agents}
@@ -448,7 +454,13 @@ class CustomEnvironment(ParallelEnv):
             self.states[agent] = obs
 
         infos = {a: {} for a in self.agents}
-        
+        for a in self.agents:
+            panel_energy = self.irradiance_level[a] * self.max_irrad * self.panel_surfaces[a] * self._proc_interval * self.panel_efficiency
+            panel_energy /= self.max_irrad * self.panel_surfaces[a] * self.panel_efficiency * self._proc_interval
+            infos[a] = {
+                "panel_energy": panel_energy,
+                "processed_frames": self.fs[a]/(self._processing_rate * self.max_steps),
+            }        
         if any(terminations.values()) or all(truncations.values()):
             self.agents = []
         

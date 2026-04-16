@@ -8,6 +8,7 @@ from env_wrapper import EnvWrapper
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import torch
 
@@ -652,3 +653,82 @@ class SB3_MAS_Train:
         self.save_framerate_csv(folder_path, fs, hs, framerates)
         self.save_offloading_matchings_csv(folder_path,hs_matchings)
         
+    
+    def evaluate(self):
+        for i in range(self.num_agents):
+            batt = int(self.battery_capacities[i])
+            path = f"./saved_models/DQN_{batt}Wh_*_*.zip"
+            found_files = glob.glob(path)[0]
+            print(f"Loading model for agent {i} -> found files: {found_files}")
+            if found_files:
+                self.models[i].load(found_files)
+        
+        obs = self.env.reset(self.seed)[0]
+        agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": []} for agent_id in range(self.num_agents)}
+        terminate = False
+        while not terminate:
+            actions = {}
+            for agent_id in range(self.num_agents):
+                agent_obs = obs[agent_id]
+                action, _ = self.models[agent_id].predict(agent_obs, deterministic=True)
+                actions[agent_id] = self.decode(action)
+                agents_logs[agent_id]['processing'].append(actions[agent_id][0]/self.proc_rate)
+                agents_logs[agent_id]['offloading'].append(actions[agent_id][1]/2)
+            next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+            
+            for agent_id in range(self.num_agents):
+                print(f"Agent {agent_id} - State: {obs[agent_id][2]})")
+                #agents_logs[agent_id]["sun"].append(obs[agent_id][2])
+                agents_logs[agent_id]["battery"].append(obs[agent_id][0])
+                agents_logs[agent_id]["state"].append(obs[agent_id][1]/3)
+                agents_logs[agent_id]["panel_energy"].append(infos[agent_id]["panel_energy"])
+                agents_logs[agent_id]["backlog"].append(obs[agent_id][1]/3)
+                agents_logs[agent_id]["processed_frames"].append(infos[agent_id]["processed_frames"])
+                agents_logs[agent_id]["hs_counter"].append(self.env.hs[agent_id])
+                #agents_logs[agent_id]["processing"].append(obs[agent_id][4])
+                done = terminations[agent_id] or truncations[agent_id]
+                if done:
+                    terminate = True
+
+            obs = next_obs
+        
+        window_size = 50  # Più è alto, più appiattisce
+        
+        # Plot battery levels and processing decisions for all agents
+        plt.figure(figsize=(12, 24))
+        for agent_id in range(self.num_agents):
+            processing_smoth = pd.Series(agents_logs[agent_id]['processing']).rolling(window=window_size, center=True).mean()
+            #backlog_smoth = agents_logs[agent_id]['backlog'] #pd.Series(agents_logs[agent_id]['backlog']).rolling(window=window_size, center=True).mean()
+
+            plt.subplot(self.num_agents, 1, agent_id + 1)
+            plt.plot(agents_logs[agent_id]['battery'], label='Battery Level')
+            #plt.plot(processing_smoth, label='Smoothed Processing Decision')
+            plt.plot(agents_logs[agent_id]['panel_energy'], label='Panel Energy')
+            plt.plot(agents_logs[agent_id]['backlog'], label='Backlog')
+            plt.plot(agents_logs[agent_id]['processed_frames'], label='Processed Frames')  # Aggiunta della linea dei frame processati
+            #plt.plot(agents_logs[agent_id]['hs_counter'], label='Processing from offloading')  # Aggiunta della linea del contatore dei messaggi
+            plt.plot(agents_logs[agent_id]['offloading'], label='Offloading Decision')  # Aggiunta della linea della decisione di offloading
+
+            #plt.plot(agents_logs[agent_id]['state'], label='Smoothed State')  # Aggiunta della linea dello stato (con trasparenza)
+
+            # Color area when battery is 0
+            threshold = 0
+            plt.fill_between(range(len(agents_logs[agent_id]['battery'])),
+                            0,
+                            1,
+                            where=(np.array(agents_logs[agent_id]['battery']) <= threshold), 
+                            color='red', alpha=0.2, label='Battery Depleted')
+            
+
+            plt.title(f'Agent {agent_id} Evaluation')
+            plt.xlabel('Timestep')
+            plt.ylabel('Value')
+            plt.legend()
+            plt.grid()
+        plt.tight_layout()
+        plt.savefig(f"evaluation_{self.num_episodes-1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.mode}.png")
+        plt.close() 
+
+        print("Total processed frames during evaluation:", self.env.total_frames_processed)
+            
+
