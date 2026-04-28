@@ -461,7 +461,10 @@ class SB3_MAS_Train:
 
         total_timesteps = self.num_episodes * self.max_steps
         
+        times = []
+        
         for i in range(0, self.num_episodes):
+            temp = time.time()
             obs = self.env.reset()
             
             rewards_episode = {agent: 0.0 for agent in range(self.num_agents)}
@@ -524,6 +527,8 @@ class SB3_MAS_Train:
                 obs = next_obs    
                 step += 1
             
+            temp = time.time() - temp
+            times.append(temp)
             
             # input(self.env.hs_counter)
             # for agent in range(0, self.num_agents):
@@ -532,7 +537,7 @@ class SB3_MAS_Train:
             #     else:
             #         hs_to_print.append(0.0)
                 
-            print(f"Episode {i + 1}/{self.num_episodes} - rewards: {rewards_episode} - epsilon: {self.eps}")
+            print(f"Episode {i + 1}/{self.num_episodes} - rewards: {rewards_episode} - epsilon: {round(self.eps, 3)} - time: {temp}")
 
             for agent_id in range(0, self.num_agents):            
                 fs[agent_id].append(self.env.fs[agent_id] / self.env.max_steps)
@@ -581,7 +586,7 @@ class SB3_MAS_Train:
         self.save_battery_csv(folder_path, battery_daily)
         self.save_backlog_csv(folder_path, backlogs_daily)
         self.save_rewards_csv(folder_path, rewards_plot)
-        # self.save_time_csv(folder_path, times)
+        self.save_time_csv(folder_path, times)
         self.save_framerate_csv(folder_path, fs, hs, framerates)
         self.save_offloading_matchings_csv(folder_path,hs_matchings)
         

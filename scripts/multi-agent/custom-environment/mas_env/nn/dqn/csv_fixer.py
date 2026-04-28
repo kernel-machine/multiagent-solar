@@ -16,9 +16,9 @@ import glob
 proc_interval   = 60
 max_steps   = int(24 * 60 * 60 / proc_interval)
 
-num_agents  = 2
-battery_capacities_wh = [25, 100]
-# battery_capacities_wh = [25, 100, 50, 37, 65]   
+num_agents  = 5
+# battery_capacities_wh = [25, 100]
+battery_capacities_wh = [25, 100, 50, 37, 65]   
 battery_capacities  = [b for b in battery_capacities_wh]  
 
 power_idle  = 2.6
@@ -30,7 +30,7 @@ episode   = 355
 mode  = "cuda"
 w   = 1.0
 
-CSV_DIR  = "./20260323_174131/csvs/csvs_batch_256"
+CSV_DIR  = "./20260409_025840/csvs/csvs_batch_256"
 PLOT_DIR   = "."
 WINDOW = 10
 

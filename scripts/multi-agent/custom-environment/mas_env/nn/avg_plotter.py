@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import csv
 import os
 
-agents = 2
+agents = 5
 timesteps = 1440
 episodes = 4001
 
@@ -246,10 +246,14 @@ def rewards_plotter(folder_path, episodes, agents):
             print(elem, rewards.keys())
             rewards.pop(elem)
                         
-    print(f"len rewards: {len(rewards[elem])}, agents: {agents}")
+    # print(f"len rewards: {len(rewards[elem])}, agents: {agents}")
+    print("   METHOD   -   REWARD   ")
     for elem in rewards.keys():
         for i in range(len(rewards[elem])):
             rewards[elem][i] /= agents
+            
+        print(f"{elem} - {np.mean(rewards[elem])}")
+                
                 
                 
     # print(rewards)
@@ -598,16 +602,16 @@ if __name__ == "__main__":
     
     # remove comments for excecuting plottings
     
-    # battery_sampled_plotter(folder_path, 1440, agents)
-    # backlog_sampled_plotter(folder_path, 1440, agents)
+    battery_sampled_plotter(folder_path, 1440, agents)
+    backlog_sampled_plotter(folder_path, 1440, agents)
     
-    # rewards_plotter(folder_path, 4001, agents)
-    # framerate_plotter(folder_path, 4001, agents)
+    rewards_plotter(folder_path, 4001, agents)
+    framerate_plotter(folder_path, 4001, agents)
 
     # method used for having same format of dqn tests
     # file_cutter(folder_path + "/Tabular/", timesteps, 400)
     
-    rewards_compare(folder_path, 4001)
-    framerate_compare(folder_path, 4001)
-    backlog_compare(folder_path, 1440)
-    battery_compare(folder_path, 1440)
+    # rewards_compare(folder_path, 4001)
+    # framerate_compare(folder_path, 4001)
+    # backlog_compare(folder_path, 1440)
+    # battery_compare(folder_path, 1440)

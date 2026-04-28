@@ -83,7 +83,7 @@ def plot_daily_irradiance_timestep(
 
 if __name__ == "__main__":
     datapath = '../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv'
-    day_of_year = 233
+    day_of_year = 172
     delta_time = 15 * 60
     proc_interval = 1 * 60
 
