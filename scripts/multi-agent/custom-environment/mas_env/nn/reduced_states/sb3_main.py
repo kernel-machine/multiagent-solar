@@ -18,7 +18,7 @@ irradiance_datapaths = [
     ]
 
 delta_time = 15 * 60
-proc_interval = 1 * 60
+proc_interval = 5 * 60
 proc_rate = 20
 arrival_rate = 15
 
@@ -46,7 +46,7 @@ eps_dec = 0.9985
 # battery_capacities = [25, 100, 50, 37, 65]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65]
 
-num_agents = 10
+num_agents = 5
 battery_capacities = [
     25, 
     100,  
@@ -120,8 +120,9 @@ if __name__ == "__main__":
         mode,
         batch_size,
         seed,
-        env=env
+        env=env,
+        save_path="models/reduced_states"
         )
     
-    trainer1.train()
-    trainer1.evaluate()
+    #trainer1.train()
+    trainer1.evaluate(model_paths="./models/reduced_states")

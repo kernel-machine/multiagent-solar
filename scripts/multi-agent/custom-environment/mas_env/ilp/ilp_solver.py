@@ -58,8 +58,9 @@ class SB3_MAS_Train:
         B = cp.Variable((N, T+1), nonneg=True)
         E = cp.Variable((N, T+1))
         spill = cp.Variable((N, T), nonneg=True)       
-        SLACK_PENALTY = 1e6
-        slack = cp.Variable((N, T), nonneg=True)
+        # SLACK REMOVED — forces strict E >= 0 like RL environment
+        # slack = cp.Variable((N, T), nonneg=True)
+        y = cp.Variable((N, N, T), boolean=True) # Unicast transmission indicator
         
         self.Eharv = np.array(self.irradiance_arrays) # (N, T)
         self.Eharv = np.array([e[:T] for e in self.Eharv])
@@ -77,6 +78,10 @@ class SB3_MAS_Train:
         constraints += [E >= 0]
         constraints += [E <= np.array(self.battery_capacities_wh).reshape(-1, 1)*3600]
 
+        # Set upper bound for x
+        UB = self.proc_rate * self.proc_interval_s
+        constraints += [x <= UB]
+
         for t in range(T):
             out_i = []
             in_i = []
@@ -85,6 +90,14 @@ class SB3_MAS_Train:
                 in_i.append(cp.sum(x[:, i, t]) - x[i, i, t])   # sum_{h!=i} x_hi
 
             for i in range(N):
+                # Unicast transmission constraint: an agent can only send to ONE other agent at time t
+                constraints += [ cp.sum(y[i, :, t]) - y[i, i, t] <= 1 ]
+                
+                # Big-M constraint to link x and y for transmissions
+                for j in range(N):
+                    if i != j:
+                        constraints += [ x[i, j, t] <= UB * y[i, j, t] ]
+
                 # same-slot availability
                 constraints += [
                     x[i, i, t] + out_i[i] <= B[i, t] + A[i, t] + in_i[i]
@@ -101,13 +114,12 @@ class SB3_MAS_Train:
                 ]
 
                 panel_energy_j = self.Eharv[i, t] * self.proc_interval_s * self.panel_surfaces[i] * 0.2
-                # Slack models temporary energy deficit and is heavily penalized in the objective.
+                # Energy conservation WITHOUT slack — strict E >= 0
                 constraints += [
                     E[i, t+1] == E[i, t] + panel_energy_j - self.e_idle
                     - self.e_frame * x[i, i, t]
                     - self.e_tx_rx * (out_i[i] + in_i[i])
                     - spill[i, t]
-                    + slack[i, t]
                 ]
 
         processed_total = cp.sum([x[i, i, k] for i in range(N) for k in range(T)])
@@ -119,13 +131,13 @@ class SB3_MAS_Train:
         objective = cp.Maximize(
             processed_total
             - EPSILON_OBJ * tx_total
-            - SLACK_PENALTY * cp.sum(slack)
             - SPILL_PENALTY * cp.sum(spill)
         )
         self.x = x
         self.prob = cp.Problem(objective, constraints)
         self.battery = E
         self.buffer = B
+        self.slack = None  # Slack removed
 
     def solve(self):
         self.prob.solve(verbose=True,
@@ -147,32 +159,34 @@ class SB3_MAS_Train:
         plt.figure(figsize=(12, 24))
         for agent_id in range(self.num_agents):
             plt.subplot(self.num_agents, 1, agent_id + 1)
-            values = self.x[agent_id, agent_id, :].value
-            values /= self.proc_rate * self.proc_interval_s
-            plt.plot(values, label='Processed Locally')
-            
-            for other in range(self.num_agents):
-                if other != agent_id:
-                     values = self.x[agent_id, other, :].value
-                     values /= (self.proc_rate * self.proc_interval_s)
-                     values /= max(values)
-                     plt.plot(values, label=f'Processed for Agent {other}')
 
+            ax1 = plt.gca()
+            ax1.plot(self.x[agent_id, agent_id, :].value / (self.proc_rate * self.proc_interval_s), label='Processed Locally', color='tab:blue')
+            
             irradiance = self.Eharv[agent_id, :] * self.proc_interval_s * self.panel_surfaces[agent_id] * 0.2
             max_irradiance = 1000 * self.proc_interval_s * self.panel_surfaces[agent_id] * 0.2
-            irradiance /= max_irradiance
-            plt.plot(irradiance*2, label='Irradiance')  # Aggiunta della linea dell'irradianza (con trasparenza)
+            ax1.plot(irradiance * 2 / max_irradiance, label='Irradiance', color='tab:orange')
             
-            plt.plot(
+            ax1.plot(
                 self.battery[agent_id, :].value / (self.battery_capacities_wh[agent_id] * 3600),
-                label='Battery Level'
-            )  # Aggiunta della linea del livello della batteria (con trasparenza)
-            plt.plot(self.buffer[agent_id, :].value / (self.arrival_rate * self.proc_interval_s *200), label='Buffer Level')  # Aggiunta della linea del livello del buffer (con trasparenza)
+                label='Battery Level', color='tab:red'
+            )
+            ax1.plot(self.buffer[agent_id, :].value / (self.arrival_rate * self.proc_interval_s * 150), label='Buffer Level', color='tab:purple')
+
+            # Tx frames to nodes different from itself
+            tx_total = np.array([ np.sum(self.x[agent_id, :, t].value) - self.x[agent_id, agent_id, t].value for t in range(len(self.irradiance_arrays[0]))])
+            ax1.plot(tx_total / (self.proc_rate * self.proc_interval_s), label='Frames Transmitted', color='tab:green')
+            
+            # Rx frames from nodes different from itself
+            rx_total = np.array([ np.sum(self.x[:, agent_id, t].value) - self.x[agent_id, agent_id, t].value for t in range(len(self.irradiance_arrays[0]))])
+            ax1.plot(rx_total / (self.proc_rate * self.proc_interval_s * self.num_agents), label='Frames Received', color='tab:cyan')
+            
+            # Limita l'asse Y per evitare che i picchi enormi schiaccino la linea a 0.75
+            ax1.set_ylim(-0.05, 1.05)
             
             plt.title(f'Agent {agent_id}')
-            plt.xlabel('Time Step')
-            plt.ylabel('Frames Processed')
             plt.legend()
+            plt.grid()
         plt.tight_layout()
         plt.savefig('ilp_solution.png')
         #plt.show()

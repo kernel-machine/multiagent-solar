@@ -30,6 +30,7 @@ class BaseEnvironment(ParallelEnv):
         
         self.max_irrad = 1000.0
         self.panel_efficiency = 0.2
+        self.max_storage = self._processing_rate * self._proc_interval * 30
         
         self.irradiance_data = []
         self.irradiance_arrays = []
@@ -53,13 +54,7 @@ class BaseEnvironment(ParallelEnv):
         self.e_frame = (0.8 * (power_max - power_idle) * 1) / proc_rate
         self.e_tx_rx = (0.2 * (power_max - power_idle) * 1) / proc_rate
         
-        self.backlogs = [0 for i in range(0, self._num_agents)]
-        
-        # state_i = (battery_level_i, daily_completion_i)
-        self.states = [[0.0, 0, 0.0] for i in range(0, self._num_agents)]
-        self.actions = [[0.0, 0, 0.0, 0.0] for i in range(0, self._num_agents)]
-        self.rewards = [0 for i in range(0, self._num_agents)]
-        
+        self.backlogs = [0 for i in range(0, self._num_agents)]        
         # internal counters for episode compeltion 
         self.timestep = 0
         self.max_steps = (3600 / proc_interval) * 5
@@ -75,20 +70,6 @@ class BaseEnvironment(ParallelEnv):
         self.fs = [0 for i in range(0, self._num_agents)]
         self.hs = [0 for i in range(0, self._num_agents)]
         self.hs_counter = [0 for i in range(0, self._num_agents)] # Message exchange counter for each agent, used for logging purposes
-
-    # function for retrieving level of backlog
-    def calculate_backlog_level(self, agent_id):
-        qty = self.backlogs[agent_id]
-        max_storage = self._processing_rate * self._proc_interval * 10
-        
-        if(qty == 0):
-            return 0
-        elif(qty > 0 and qty < int(max_storage / 3)):
-            return 1
-        elif(qty >= int(max_storage / 3) and qty < int((2/3) * max_storage)):
-            return 2
-        else:
-            return 3
         
     def calculate_reward_locally(self, agent_id):
         fti = self.actions[agent_id][0]
@@ -181,69 +162,8 @@ class BaseEnvironment(ParallelEnv):
                                    agent_id,
                                    self._w
                                    )
-    
-    def update_state(self, agent_id, panel_energy, needed_energy, processed):
-        '''
-        state: [0 -> battery, 1-> backlog, 2-> timestep]
-        '''
-        
-        # battery update
-        self.battery_energies[agent_id] += (panel_energy - needed_energy)
-        if(self.battery_energies[agent_id] < 0.0):
-            self.battery_energies[agent_id] = 0.0
-        
-        # backlog update
-        self.backlogs[agent_id] -= processed
-        if(self.backlogs[agent_id] < 0):
-            self.backlogs[agent_id] = 0
-        
-        self.states[agent_id][0] = round(float(self.battery_energies[agent_id] / self.battery_capacities[agent_id]), 2)
-        self.states[agent_id][1] = self.calculate_backlog_level(agent_id)
-        self.states[agent_id][2] = round(float(self.timestep / self.max_steps), 4)
-        
-    def update_states_locally(self):
-        local_states = []
-        
-        for agent_id in range(0, self._num_agents):
-            fti = self.actions[agent_id][0]
-            
-            idx = (self.episode * self.max_steps) + self.timestep
-            self.irradiance_level[agent_id] = self.irradiance_arrays[agent_id][idx] / self.max_irrad
-            panel_energy = self.irradiance_level[agent_id] * self.max_irrad * self.panel_surfaces[agent_id] * self._proc_interval * self.panel_efficiency
 
-            if agent_id == 0 and panel_energy > 0:
-                pass
-            
-            actual_battery = self.battery_energies[agent_id] + panel_energy
-            backlog = self.backlogs[agent_id]
-            
-            # LOCAL PROCESSING
-            processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_frame), self._processing_rate * self._proc_interval), 0)
-            needed_energy = (fti * self._proc_interval * self.e_frame) + self.e_idle
-            
-            local_processing = 0
-            
-            if actual_battery > needed_energy and processable > 0:
-                processed = min(processable, fti * self._proc_interval)
-                self.total_frames_processed += processed
-                backlog = max(backlog - processed, 0)
-                actual_battery = max(actual_battery - needed_energy, 0)
-                local_processing = processed / self._proc_interval
-            else:
-                actual_battery = max(actual_battery - self.e_idle, 0)
-            
-            local_states.append({
-                'battery': actual_battery,
-                'backlog': backlog,
-                'local_processing': local_processing
-            })
-            
-            self.fs[agent_id] += local_processing
         
-        for agent_id in range(self._num_agents):
-            self.battery_energies[agent_id] = local_states[agent_id]['battery']
-            self.backlogs[agent_id] = local_states[agent_id]['backlog']
-
     def update_states_offloading(self):
         
         for agent_id in range(0, self._num_agents):
@@ -311,9 +231,21 @@ class BaseEnvironment(ParallelEnv):
 
     def step(self, actions):
         # manual copy of actions inside internal actions variable
-        for i in range(0, self._num_agents):
-            for j in range(0, len(actions[i])):
-                self.actions[i][j] = actions[i][j]
+        # for i in range(0, self._num_agents):
+        #     agent_action = actions[i]
+
+        #     if np.isscalar(agent_action):
+        #         self.actions[i][0] = int(agent_action)
+        #         self.actions[i][1] = 0
+        #         self.actions[i][2] = 0
+        #         self.actions[i][3] = 0
+        #         continue
+
+        #     agent_action = np.asarray(agent_action).flatten()
+        #     self.actions[i][0] = int(agent_action[0]) if len(agent_action) > 0 else 0
+        #     self.actions[i][1] = int(agent_action[1]) if len(agent_action) > 1 else 0
+        #     self.actions[i][2] = int(agent_action[2]) if len(agent_action) > 2 else 0
+        #     self.actions[i][3] = int(agent_action[3]) if len(agent_action) > 3 else 0
 
         # updating backlogs with arriving frames for each agent
         for agent_id in range(0, self._num_agents):
@@ -321,55 +253,87 @@ class BaseEnvironment(ParallelEnv):
                 frames_arrived = self._arrival_rate * self._proc_interval
                 self.backlogs[agent_id] += frames_arrived
 
-        # for each agent is returned the reward according the reward function defined a priori        
-        rewards = {a: self.calculate_reward_locally(a) for a in self.agents}
-        self.update_states_locally()
+        rewards = {}
 
-        # input(rewards)
-               
-        terminations = {a: False for a in self.agents}
+        for agent_id in range(0, self._num_agents): # Penalize buffer overflow
+            if self.backlogs[agent_id] > self.max_storage:
+                difference = self.backlogs[agent_id] - self.max_storage
+                self.backlogs[agent_id] = self.max_storage
+                rewards[agent_id] = -difference
+
+        # Local state update (inlined from update_states_locally)
+        terminations = {}
+        for agent_id in range(0, self._num_agents):
+            fti = actions[agent_id][0]
+            idx = (self.episode * self.max_steps) + self.timestep
+            self.irradiance_level[agent_id] = self.irradiance_arrays[agent_id][idx] / self.max_irrad
+            panel_energy = self.irradiance_level[agent_id] * self.max_irrad * self.panel_surfaces[agent_id] * self._proc_interval * self.panel_efficiency
+
+            actual_battery = self.battery_energies[agent_id] + panel_energy
+            backlog = self.backlogs[agent_id]
+
+            #processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_frame), self._processing_rate * self._proc_interval), 0)
+            processed_images = fti * self._proc_interval
+            processed_images = min(processed_images, backlog)
+            needed_energy = (processed_images * self.e_frame) + self.e_idle
+
+            local_processing = 0
+            if actual_battery > needed_energy:
+                self.total_frames_processed += processed_images
+                backlog = max(backlog - processed_images, 0)
+                local_processing = processed_images / self._proc_interval
+                
+                rewards[agent_id] =  processed_images
+                terminations[agent_id] = False
+            else:
+                rewards[agent_id] = -processed_images - backlog
+                terminations[agent_id] = True
+
+            actual_battery = max(actual_battery - needed_energy, 0)
+
+
+            if backlog > self.max_storage:
+                backlog_difference = backlog - self.max_storage
+                rewards[agent_id] -= backlog_difference
+                backlog = self.max_storage
+
+            #print(f"Agent {agent_id} - IDX: {idx} - rewards: {rewards[agent_id]} - Batt: {actual_battery} - Proc: {processable} - Actions: {actions[agent_id]}")
+            rewards[agent_id] /= (self._processing_rate * self._proc_interval)
+            self.battery_energies[agent_id] = min(actual_battery, self.battery_capacities[agent_id])
+            self.backlogs[agent_id] = backlog
+            self.fs[agent_id] += local_processing
+
+        # update_states_offloading calculate offloading processing and energy penalty
+        #self.update_states_offloading()
+        
         truncations = {a: False for a in self.agents}
-        
+                
         if(self.timestep == (self.max_steps - 1)):
-            # self.episode = 355
             truncations = {a: True for a in self.agents}
-        
-        self.timestep += 1
-        
-        # update of states after receiving all actions
-        rewards_offloading = {a: self.calculate_reward_offloading(a) for a in self.agents}
-        self.update_states_offloading()
-        
-        # input(rewards_offloading)
-        
-        for elem in rewards_offloading:
-            rewards[elem] += rewards_offloading[elem]
-        
-        # observations structure is a dictionary with keys the indeces of agents
-        observations = self.gen_obs()
 
+        self.timestep += 1
+        obs = self.gen_obs()
+        
         infos = {}
-        for a in self.agents:
+        for a in self.possible_agents:
+            idx = (self.episode * self.max_steps) + self.timestep
             panel_energy = self.irradiance_level[a] * self.max_irrad * self.panel_surfaces[a] * self._proc_interval * self.panel_efficiency
             panel_energy /= self.max_irrad * self.panel_surfaces[a] * self.panel_efficiency * self._proc_interval
             infos[a] = {
                 "panel_energy": panel_energy,
                 "processed_frames": self.fs[a]/(self._processing_rate * self.max_steps),
+                "tx_frames_step": self.hs[a],
+                "rx_frames_step": self.hs_counter[a]
             }
 
-        if any(terminations.values()) or all(truncations.values()):
-            self.agents = []
 
-        return observations, rewards, terminations, truncations, infos
+
+        return obs, rewards, terminations, truncations, infos
 
     def reset(self, seed=None, options=None):
         self.agents = copy(self.possible_agents)
-        
-        # setting to 0 all training variables
         self.timestep = 0
-        self.states = [[0.5, 0, 0.0] for i in range(0, self._num_agents)]
-        self.actions = [[0.0, 0, 0.0, 0.0] for i in range(0, self._num_agents)]
-        self.battery_energies = [(self.battery_capacities[i] * self.states[i][0]) for i in range(0, self._num_agents)]
+        self.battery_energies = [(self.battery_capacities[i] * 0.5) for i in range(0, self._num_agents)]
         self.backlogs = [0 for i in range(0, self._num_agents)]
         self.total_frames_processed = 0
 

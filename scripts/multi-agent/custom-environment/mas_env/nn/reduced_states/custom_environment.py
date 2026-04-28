@@ -1,18 +1,12 @@
 import os
 import sys
 
-from pettingzoo import ParallelEnv
 from gymnasium import spaces
-import matplotlib.pyplot as plt
 from copy import copy
 
-import functools
 import numpy as np
-import random
 import math
 
-import interpol as ip
-import jit_reward_function as jrf
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from base_envirionment import BaseEnvironment

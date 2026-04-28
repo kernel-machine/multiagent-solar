@@ -1,2 +1,8 @@
 env
 *.pyc
+*.png
+*.pdf
+*.csv
+*.zip
+scripts/multi-agent/custom-environment/mas_env/runs/*
+scripts/multi-agent/custom-environment/mas_env/models/*

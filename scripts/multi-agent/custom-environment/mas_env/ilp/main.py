@@ -23,9 +23,9 @@ eps_fin = 0.05
 # eps_dec = 0.999
 eps_dec = 0.9985
 
-num_agents = 5
+num_agents = 4
 battery_capacities = [
-    25, 
+    50, 
     100,  
     50,   
     37,   

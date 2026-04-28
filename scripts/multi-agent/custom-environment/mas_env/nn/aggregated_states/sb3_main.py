@@ -27,7 +27,10 @@ proc_interval = 5 * 60
 proc_rate = 20
 arrival_rate = 15
 
-num_episodes = 4001
+# Algorithm choice: "DQN" or "PPO"
+algo = "PPO"
+
+num_episodes = 251
 
 eps_init = 1.0
 eps_fin = 0.05
@@ -47,8 +50,8 @@ eps_dec = 0.9985
 # battery_capacities = [25, 100, 50, 37]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85]
 
-num_agents = 5
-battery_capacities = [25, 100, 50, 37, 65]
+num_agents = 3
+battery_capacities = [50, 100, 50, 60, 65]
 panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65]
 
 # num_agents = 10
@@ -85,11 +88,11 @@ power_max = 6.0
 w = 1.0
 
 train_freq = 16
-batch_size = 256
+batch_size = 64
 
 mode = 'cuda'
 
-seed = "linbear" # "fixed_winter", "fixed_summer", "linear"
+seed = "fixed_winter" # "fixed_winter", "fixed_summer", "linear"
 
 env = CustomEnvironment(
     num_agents,
@@ -127,7 +130,10 @@ if __name__ == "__main__":
         mode,
         batch_size,
         seed,
-        env = env
+        env = env,
+        save_path="models/aggregated_states",
+        num_envs=4,  # PPO parallel environments for better exploration (ignored for DQN)
+        algo=algo
         )
     
     # trainer2 = SB3_MAS_Train_Parallelized_Threads(
@@ -176,5 +182,5 @@ if __name__ == "__main__":
     
     # trainer3.train()
     # trainer2.train()
-    #trainer1.train()
-    trainer1.evaluate()
+    trainer1.train()
+    trainer1.evaluate(model_paths="models/aggregated_states")

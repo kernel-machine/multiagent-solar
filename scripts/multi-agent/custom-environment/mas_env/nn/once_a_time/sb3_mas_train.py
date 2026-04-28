@@ -4,7 +4,7 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from custom_environment import CustomEnvironment
-from env_wrapper import EnvWrapper
+from env_wrapper import EnvWrapper, EnvWrapperDQN
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -42,7 +42,8 @@ class SB3_MAS_Train:
                  mode,
                  batch_size,
                  smart_node,
-                 seed
+                 seed,
+                 train_all_mode=1
                 ):
         
         self.num_agents = num_agents
@@ -72,6 +73,7 @@ class SB3_MAS_Train:
         self.eps = 0
         
         self.smart_node = smart_node
+        self.train_all_mode = train_all_mode
         print(smart_node)
         
         self.env = CustomEnvironment(
@@ -100,7 +102,7 @@ class SB3_MAS_Train:
         
         self.models = {i : DQN(
                 policy="MlpPolicy",
-                env=EnvWrapper(self.env, i),
+                env=EnvWrapperDQN(self.env, i),
                 learning_rate=0.0001,
                 buffer_size=10000,
                 learning_starts=500,
@@ -131,6 +133,38 @@ class SB3_MAS_Train:
         for i in range(num_agents):
             self.models[i].set_logger(configure(None, ["stdout"]))
             print(f"Agent {i} device: {self.models[i].device}")
+
+        self.models_folder = Path("./models/once_a_time")
+
+
+    def _load_latest_model_for_agent(self, agent_id):
+        pattern = f"DQN_agent{agent_id}_*.zip"
+        file_py = list(self.models_folder.glob(pattern))
+
+        if not file_py:
+            return False
+
+        most_recent = max(file_py, key=lambda f: f.stat().st_mtime)
+        print(f"Loading agent {agent_id}: {most_recent}")
+
+        model = DQN.load(str(most_recent))
+        wrapped_env = EnvWrapperDQN(self.env, agent_id)
+        venv = DummyVecEnv([lambda: wrapped_env])
+        model.set_env(venv)
+        model.learn(total_timesteps=0)
+        self.models[agent_id] = model
+        return True
+
+
+    def _save_model_for_agent(self, agent_id):
+        os.makedirs(self.models_folder, exist_ok=True)
+        model_filename = (
+            f"DQN_agent{agent_id}_"
+            f"{self.battery_capacities[agent_id]}Wh_"
+            f"{self.num_episodes - 1}_{self.env.episode}_{self.proc_interval}_{self.num_agents}agents_{self.mode}"
+        )
+        self.models[agent_id].save(str(self.models_folder / model_filename))
+        print(f"saved model: {self.models_folder / model_filename}.zip")
         
     
     def plot_rewards(self, folder_path, rewards):
@@ -156,6 +190,16 @@ class SB3_MAS_Train:
         plt.savefig(f"./{folder_path}/rewards_plot_{self.num_episodes - 1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.mode}.pdf")
         plt.close()
 
+
+    def _smooth_for_plot(self, values, window):
+        values = np.asarray(values)
+        if values.size == 0:
+            return None, None
+
+        smooth_values = np.convolve(values, np.ones(window) / window, mode='valid')
+        x_values = range(len(smooth_values))
+        return x_values, smooth_values
+
     
     def plot_battery_levels(self, folder_path, levels):
         window = 10
@@ -167,7 +211,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):    
             # print(rewards[i])
-            plt.plot(range(window - 1, len(levels[i])), np.convolve(levels[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(levels[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(levels[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -193,7 +240,10 @@ class SB3_MAS_Train:
             plt.ylabel("Battery")
         
             # print(rewards[i])
-            plt.plot(range(window - 1, len(levels[i])), np.convolve(levels[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(levels[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(levels[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
             plt.grid()
@@ -213,7 +263,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):
             # print(rewards[i])
-            plt.plot(range(window - 1, len(backlogs[i])), np.convolve(backlogs[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(backlogs[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(backlogs[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -235,11 +288,13 @@ class SB3_MAS_Train:
             plt.ylabel("Battery")
             for i in range(0, len(data[elem])):
                 # print(rewards[i])
-                plt.plot(range(window - 1, len(data[elem][i])), np.convolve(data[elem][i], np.ones(window)/window, mode='valid'), label = f"{i * (int((self.num_episodes-1) / 10))}-th episode", alpha = 1.0)
+                x_values, smooth_values = self._smooth_for_plot(data[elem][i], window)
+                if x_values is None:
+                    continue
+                plt.plot(x_values, smooth_values, label = f"{i * (int((self.num_episodes-1) / 10))}-th episode", alpha = 1.0)
             
             plt.grid()
             plt.legend(bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=3)
-            plt.tight_layout()
             plt.savefig(f"./{folder_path}/battery_{int(self.env.battery_capacities[elem] / 3600)}Wh_{self.num_episodes-1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.mode}.pdf")
             plt.close()
             
@@ -256,12 +311,14 @@ class SB3_MAS_Train:
             plt.ylabel("Backlog")
             for i in range(0, len(data[elem])):
                 # print(rewards[i])
-                plt.plot(range(window - 1, len(data[elem][i])), np.convolve(data[elem][i], np.ones(window)/window, mode='valid'), label = f"{i* (int((self.num_episodes-1) / 10))}-th episode", alpha = 1.0)
+                x_values, smooth_values = self._smooth_for_plot(data[elem][i], window)
+                if x_values is None:
+                    continue
+                plt.plot(x_values, smooth_values, label = f"{i* (int((self.num_episodes-1) / 10))}-th episode", alpha = 1.0)
             
             plt.grid()
             # plt.legend()
             plt.legend(bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=3)
-            plt.tight_layout()
             plt.savefig(f"./{folder_path}/backlog_{int(self.env.battery_capacities[elem] / 3600)}Wh_{self.num_episodes-1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.mode}.pdf")
             plt.close()        
 
@@ -276,7 +333,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):
             # print(rewards[i])
-            plt.plot(range(window - 1, len(fs[i])), np.convolve(fs[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(fs[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(fs[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -296,7 +356,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):
             # print(rewards[i])
-            plt.plot(range(window - 1, len(fs[i])), np.convolve(fs[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(fs[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(fs[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -316,7 +379,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):
             # print(rewards[i])
-            plt.plot(range(window - 1, len(fs[i])), np.convolve(fs[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(fs[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(fs[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -336,7 +402,10 @@ class SB3_MAS_Train:
         
         for i in range(0, self.env._num_agents):
             # print(rewards[i])
-            plt.plot(range(window - 1, len(fs[i])), np.convolve(fs[i], np.ones(window)/window, mode='valid'), label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
+            x_values, smooth_values = self._smooth_for_plot(fs[i], window)
+            if x_values is None:
+                continue
+            plt.plot(x_values, smooth_values, label = f"smooth {self.battery_capacities[i]}Wh", alpha = 1.0)
             # plt.plot(fs[i], label = f"raw {self.battery_capacities[i]}Wh", alpha = 0.3)
         
         plt.grid()
@@ -454,17 +523,17 @@ class SB3_MAS_Train:
         return [fti, xti, gti, hti]
     
     
-    def get_action(self, agent_id, obs, actions_encoded, actions):
+    def get_action(self, agent_id, obs, actions_encoded, actions, active_training_node, trained_nodes):
         action = 0
-        
-        input(f"agent_id: {agent_id} - smart_node: {self.smart_node}")
 
-        if(agent_id == self.smart_node):
+        if agent_id == active_training_node:
             
             if(np.random.random() < self.eps):
                 action = self.models[agent_id].action_space.sample()
             else:
                 action, _ = self.models[agent_id].predict(obs, deterministic=False)
+        elif self.train_all_mode == 2 and agent_id in trained_nodes:
+            action, _ = self.models[agent_id].predict(obs, deterministic=True)
         else:
             action = self.models[agent_id].action_space.sample()
         
@@ -495,134 +564,146 @@ class SB3_MAS_Train:
         
         times = []
 
-        total_timesteps = self.num_episodes * self.max_steps
-        
-        folder = Path("./saved_models")
-        
-        pattern = f"DQN_*_*.zip"
-        file_py = list(folder.glob(pattern))
-        
-        if file_py:
-            most_recent = max(file_py, key=lambda f: f.stat().st_mtime)  # Usa filesystem timestamp
-            
-            print(f"Loading: {most_recent}")
-            
-            model = DQN.load(str(most_recent))
-            
-            wrapped_env = EnvWrapper(self.env, self.smart_node)
-            venv = DummyVecEnv([lambda: wrapped_env])
-            model.set_env(venv)
-            
-            model.learn(total_timesteps=0)
-            
-            for agent in range(self.num_agents):
-                self.models[agent] = model
-            
-        else:
-            print(f"No saved model found for smart_node {self.smart_node} ({self.battery_capacities[self.smart_node]}Wh)")
-            input("Press ENTER to continue with fresh model...")
-        
-        for i in range(0, self.num_episodes):
-            temp = time.time()
-            
-            obs = self.env.reset(self.seed)
-            
-            rewards_episode = {agent: 0.0 for agent in range(self.num_agents)}
-            obs = obs[0]
-    
-            battery_daily_temp = [[] for agent in range(0, self.num_agents)]
-            backlog_daily_temp = [[] for agent in range(0, self.num_agents)]
-            
-            for agent_id in range(0, self.num_agents):
-                batteries_local[agent_id] = 0
-                backlogs_local[agent_id] = 0
-                
-            step = 0
-            self.update_epsilon()
-            
-            while self.env.agents:
-                actions_encoded = {}
-                actions = {}
-                current_timestep = i * self.max_steps + step
-                progress_remaining = 1.0 - (current_timestep / total_timesteps)
-                
-                actions_encoded = {}
-                actions = {}
-                
+        if not self.models_folder.exists():
+            self.models_folder.mkdir(parents=True, exist_ok=True)
+
+        training_nodes = [self.smart_node] if self.num_agents == 1 else list(range(self.num_agents))
+        trained_nodes = set()
+
+        if self.train_all_mode not in (1, 2):
+            raise ValueError("train_all_mode must be 1 or 2")
+
+        for active_training_node in training_nodes:
+            loaded = self._load_latest_model_for_agent(active_training_node)
+            if not loaded:
+                print(
+                    f"No saved model found for agent {active_training_node} "
+                    f"({self.battery_capacities[active_training_node]}Wh), training from scratch"
+                )
+
+            self.eps = self.eps_init
+            total_timesteps = self.num_episodes * self.max_steps
+
+            for i in range(0, self.num_episodes):
+                temp = time.time()
+
+                obs = self.env.reset(self.seed)
+
+                rewards_episode = {agent: 0.0 for agent in range(self.num_agents)}
+                obs = obs[0]
+
+                battery_daily_temp = [[] for agent in range(0, self.num_agents)]
+                backlog_daily_temp = [[] for agent in range(0, self.num_agents)]
+
                 for agent_id in range(0, self.num_agents):
-                    
-                    if(np.random.random() < self.eps):
-                        action = self.models[agent_id].action_space.sample()
+                    batteries_local[agent_id] = 0
+                    backlogs_local[agent_id] = 0
+
+                step = 0
+                self.update_epsilon()
+
+                while self.env.agents:
+                    actions_encoded = {}
+                    actions = {}
+                    current_timestep = i * self.max_steps + step
+                    progress_remaining = 1.0 - (current_timestep / total_timesteps)
+
+                    actions_encoded = {}
+                    actions = {}
+
+                    self.models[active_training_node]._current_progress_remaining = progress_remaining
+
+                    for agent_id in range(0, self.num_agents):
+                        self.get_action(
+                            agent_id,
+                            obs[agent_id],
+                            actions_encoded,
+                            actions,
+                            active_training_node,
+                            trained_nodes,
+                        )
+
+                    # Ogni agente fà un scalta
+                    next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+
+                    for agent_id in range(0, self.num_agents):
+                        done = terminations[agent_id] or truncations[agent_id]
+                        rewards_episode[agent_id] += rewards[agent_id]
+
+                        if agent_id == active_training_node:
+                            action_encoded = actions_encoded[agent_id]
+
+                            self.models[agent_id].replay_buffer.add(
+                                obs=obs[agent_id],
+                                next_obs=next_obs[agent_id],
+                                action=np.array([action_encoded]),
+                                reward=np.array(rewards[agent_id]),
+                                done=np.array([done]),
+                                infos=[{}],
+                            )
+
+                            self.models[agent_id].num_timesteps += 1
+
+                        batteries_local[agent_id] += self.env.battery_energies[agent_id]
+                        backlogs_local[agent_id] += self.env.backlogs[agent_id]
+
+                        if agent_id == active_training_node:
+                            if (
+                                self.models[agent_id].num_timesteps > self.models[agent_id].learning_starts
+                                and self.models[agent_id].num_timesteps % self.train_freq == 0
+                            ):
+                                self.models[agent_id].train(
+                                    gradient_steps=self.grad_steps,
+                                    batch_size=self.batch_size,
+                                )
+
+                        if(i % int(self.num_episodes / 10) == 0):
+                            battery_daily_temp[agent_id].append(
+                                self.env.battery_energies[agent_id] / self.env.battery_capacities[agent_id]
+                            )
+                            backlog_daily_temp[agent_id].append(self.env.backlogs[agent_id])
+
+                        rewards_episode[agent_id] = round(rewards_episode[agent_id], 2)
+
+                    obs = next_obs
+                    step += 1
+
+                temp = time.time() - temp
+                times.append(temp)
+
+                print(
+                    f"Node {active_training_node} - Episode {i + 1}/{self.num_episodes} "
+                    f"- rewards: {rewards_episode} - eps: {round(self.eps, 2)} "
+                    f"- time: {round(temp, 5)} - day: {self.env.episode}"
+                )
+
+                for agent_id in range(0, self.num_agents):
+                    fs[agent_id].append(self.env.fs[agent_id] / self.env.max_steps)
+
+                    if(self.env.hs_counter[agent_id] > 0):
+                        hs[agent_id].append(self.env.hs[agent_id] / self.env.max_steps)
                     else:
-                        action, _ = self.models[agent_id].predict(obs[agent_id], deterministic=False)
-                    
-                    self.models[agent_id]._current_progress_remaining = progress_remaining     
-                    
-                    actions_encoded[agent_id] = action
-                    actions[agent_id] = self.decode(action)               
-                    
-                next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
-                                    
-                for agent_id in range(0, self.num_agents):
-                    done = terminations[agent_id] or truncations[agent_id]
-                    rewards_episode[agent_id] += rewards[agent_id]
-                    action_encoded = actions_encoded[agent_id]
-                                      
-                    self.models[agent_id].replay_buffer.add(
-                        obs = obs[agent_id],
-                        next_obs = next_obs[agent_id],
-                        action = np.array([action_encoded]),
-                        reward = np.array(rewards[agent_id]),
-                        done = np.array([done]),
-                        infos = [{}]
+                        hs[agent_id].append(0.0)
+
+                    framerates[agent_id].append(fs[agent_id][-1] + hs[agent_id][-1])
+                    rewards_plot[agent_id].append(rewards_episode[agent_id])
+                    batteries[agent_id].append(
+                        (batteries_local[agent_id] / self.env.battery_capacities[agent_id]) / self.env.max_steps
                     )
-                    
-                    self.models[agent_id].num_timesteps += 1
-                    
-                    batteries_local[agent_id] += self.env.battery_energies[agent_id]
-                    backlogs_local[agent_id] += self.env.backlogs[agent_id]
-                    
-                    if (self.models[agent_id].num_timesteps > self.models[agent_id].learning_starts and
-                        self.models[agent_id].num_timesteps % self.train_freq == 0):
-                        self.models[agent_id].train(gradient_steps=self.grad_steps, batch_size=self.batch_size)
-                    
-                    if(i % int(self.num_episodes/10) == 0):
-                        battery_daily_temp[agent_id].append(self.env.battery_energies[agent_id]/ self.env.battery_capacities[agent_id])
-                        backlog_daily_temp[agent_id].append(self.env.backlogs[agent_id])
-                    
-                    rewards_episode[agent_id] = round(rewards_episode[agent_id], 2)
-            
-                obs = next_obs    
-                step += 1
-                    
-            temp = time.time() - temp
-            times.append(temp)
+                    backlogs[agent_id].append(backlogs_local[agent_id] / self.env.max_steps)
 
-            print(f"Episode {i + 1}/{self.num_episodes} - rewards: {rewards_episode} - eps: {round(self.eps, 2)} - time: {round(temp, 5)} - day: {self.env.episode}")
-            
-            for agent_id in range(0, self.num_agents):            
-                fs[agent_id].append(self.env.fs[agent_id] / self.env.max_steps)
+                    hs_matchings[agent_id].append(int(self.env.hs_counter[agent_id]))
 
-                if(self.env.hs_counter[agent_id] > 0):
-                    hs[agent_id].append(self.env.hs[agent_id] / self.env.max_steps)
-                    # hs[agent_id].append(self.env.hs[agent_id] / self.env.hs_counter[agent_id])
+                    if(i % int(self.num_episodes / 10) == 0):
+                        battery_daily[agent_id].append(battery_daily_temp[agent_id])
+                        backlogs_daily[agent_id].append(backlog_daily_temp[agent_id])
 
-                else:
-                    hs[agent_id].append(0.0)
-                framerates[agent_id].append(fs[agent_id][-1] + hs[agent_id][-1])
-                rewards_plot[agent_id].append(rewards_episode[agent_id]) 
-                batteries[agent_id].append((batteries_local[agent_id] / self.env.battery_capacities[agent_id]) / self.env.max_steps)        
-                backlogs[agent_id].append(backlogs_local[agent_id] / self.env.max_steps)            
+                    self.env.fs[agent_id] = 0
+                    self.env.hs[agent_id] = 0
+                    self.env.hs_counter[agent_id] = 0
 
-                hs_matchings[agent_id].append(int(self.env.hs_counter[agent_id]))
-
-                if(i % int(self.num_episodes / 10) == 0):
-                    battery_daily[agent_id].append(battery_daily_temp[agent_id])
-                    backlogs_daily[agent_id].append(backlog_daily_temp[agent_id])
-
-                self.env.fs[agent_id] = 0
-                self.env.hs[agent_id] = 0
-                self.env.hs_counter[agent_id] = 0
+            self._save_model_for_agent(active_training_node)
+            trained_nodes.add(active_training_node)
         
 
         folder_path = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -652,16 +733,16 @@ class SB3_MAS_Train:
         self.save_time_csv(folder_path, times)
         self.save_framerate_csv(folder_path, fs, hs, framerates)
         self.save_offloading_matchings_csv(folder_path,hs_matchings)
+
+        print(f"Training mode {self.train_all_mode} completed for all nodes")
         
     
     def evaluate(self):
         for i in range(self.num_agents):
-            batt = int(self.battery_capacities[i])
-            path = f"./saved_models/DQN_{batt}Wh_*_*.zip"
-            found_files = glob.glob(path)[0]
-            print(f"Loading model for agent {i} -> found files: {found_files}")
-            if found_files:
-                self.models[i].load(found_files)
+            loaded = self._load_latest_model_for_agent(i)
+            if not loaded:
+                batt = int(self.battery_capacities[i])
+                print(f"No saved model found for agent {i} ({batt}Wh), keeping fresh model")
         
         obs = self.env.reset(self.seed)[0]
         agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": []} for agent_id in range(self.num_agents)}
@@ -726,9 +807,22 @@ class SB3_MAS_Train:
             plt.legend()
             plt.grid()
         plt.tight_layout()
-        plt.savefig(f"evaluation_{self.num_episodes-1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.mode}.png")
+        plt.savefig(f"evaluation_{self.num_episodes-1}_{self.env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.train_all_mode}.png")
         plt.close() 
 
         print("Total processed frames during evaluation:", self.env.total_frames_processed)
+        
+        print("\n--- Total Solar Energy Accumulated ---")
+        episode = self.env.episode
+        max_steps = int(self.env.max_steps)
+        for agent_id in range(self.num_agents):
+            total_solar_joules = 0.0
+            for t in range(max_steps):
+                idx = (episode * max_steps) + t
+                if idx < len(self.env.irradiance_arrays[agent_id]):
+                    irradiance = self.env.irradiance_arrays[agent_id][idx]
+                    total_solar_joules += irradiance * self.panel_surfaces[agent_id] * 0.2 * self.proc_interval
+            print(f"Agent {agent_id}: {total_solar_joules:.2f} Joules ({total_solar_joules/3600:.2f} Wh)")
+        print("--------------------------------------")
             
 

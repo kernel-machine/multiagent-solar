@@ -1,25 +1,26 @@
+import argparse
 from sb3_mas_train import SB3_MAS_Train
 
 
 irradiance_datapaths = [
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv'
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
+    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv'
     ]
 
 delta_time = 15 * 60
-proc_interval = 1 * 60
+proc_interval = 5 * 60
 proc_rate = 20
 arrival_rate = 15
 
-num_episodes = 1001
+num_episodes = 8000
 
 eps_init = 1.0
 eps_fin = 0.05
@@ -43,9 +44,9 @@ eps_dec = 0.99
 # battery_capacities = [25, 100, 50, 37, 65]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65]
 
-num_agents = 5
+num_agents = 4
 battery_capacities = [
-    25,     #
+    50,     #
     100,    #
     50,     #
     37,     #
@@ -83,9 +84,22 @@ batch_size = 256
 
 mode = 'cuda'
 # seed = "fixed_summer"
-seed = "average"
+seed = "fixed_winter"
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--train-all-mode",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help=(
+            "1: train each node one-by-one while others are random; "
+            "2: train one node at a time while already-trained nodes use learned policy"
+        ),
+    )
+    args = parser.parse_args()
+
     trainer1 = SB3_MAS_Train(
         num_agents,
         num_episodes,
@@ -106,7 +120,8 @@ if __name__ == "__main__":
         mode,
         batch_size,
         smart_node,
-        seed
+        seed,
+        args.train_all_mode
         )
     
     #trainer1.train()
