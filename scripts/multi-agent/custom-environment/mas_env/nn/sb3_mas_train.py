@@ -1,4 +1,5 @@
 import os
+import hashlib
 import time
 import numpy as np
 import pandas as pd
@@ -22,7 +23,7 @@ def _worker(remote, parent_remote, env):
                 obs, reward, term, trunc, info = env.step(data)
                 remote.send((obs, reward, term, trunc, info))
             elif cmd == 'reset':
-                obs, info = env.reset()
+                obs, info = env.reset(seed=data)
                 remote.send((obs, info))
             elif cmd == 'close':
                 remote.close()
@@ -46,9 +47,13 @@ class AsyncMultiAgentEnvs:
         self.total_frames_processed = env.total_frames_processed
         self.irradiance_arrays = env.irradiance_arrays
         
-    def reset(self):
-        for remote in self.remotes:
-            remote.send(('reset', None))
+    def reset(self, seed=None):
+        for idx, remote in enumerate(self.remotes):
+            if isinstance(seed, (int, np.integer)):
+                remote_seed = int(seed) + idx
+            else:
+                remote_seed = seed
+            remote.send(('reset', remote_seed))
         results = [remote.recv() for remote in self.remotes]
         obs_batch, infos_batch = zip(*results)
         return list(obs_batch), list(infos_batch)
@@ -91,38 +96,68 @@ class EnvWrapper(gym.Env):
         raise NotImplementedError("Use the trainer's step logic for multi-agent interaction.")
 
 class SB3_MAS_Train:
-    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5):
+    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5, train_all_mode=1, rotation_episodes=1, total_steps=None, use_cross_attention=False, max_agents=None, attn_d_model=16, ppo_n_steps=512, termination_mode="early"):
         self.num_agents = num_agents
         self.num_episodes = num_episodes
         self.max_steps = env.max_steps
         self.eval_env = env
-        self.num_envs = num_envs if algo.upper() == "PPO" else 1
+        self.algo = algo.upper()
+        # For mode=2 with PPO we allow parallel envs; DQN always uses 1.
+        self.num_envs = (num_envs if self.algo == "PPO" else 1)
         
         if self.num_envs > 1:
             self.env = AsyncMultiAgentEnvs(env, self.num_envs)
         else:
             self.env = env
+        # Keep a plain single env for mode=2 when num_envs==1
+        self.rotating_env = env
             
         self.save_path = save_path
-        self.algo = algo.upper()
+        self.use_cross_attention = use_cross_attention
+        self.max_agents  = max_agents if max_agents is not None else num_agents
+        self.attn_d_model = attn_d_model
         self.batch_size = batch_size
         self.random_seed = seed
         self.seed = seed
+        self.rng_seed = self._seed_to_int(seed)
         self.proc_interval = proc_interval
         self.proc_rate = proc_rate
         self.w = w
-        self.train_all_mode = 1
+        self.train_all_mode = train_all_mode
+        self.rotation_episodes = rotation_episodes
+        self.total_steps = total_steps
+        self.total_steps_done = 0
         self.battery_capacities = battery_capacities
         self.panel_surfaces = panel_surfaces
         self.train_freq = train_freq
         self.ppo_initial_lr = ppo_initial_lr
         self.ppo_final_lr = ppo_final_lr
+        self.ppo_n_steps = ppo_n_steps
+        # "early"  → episode ends as soon as any agent's battery hits 0 (old behaviour)
+        # "penalty" → episode always runs max_steps; dead agents get per-step penalty
+        self.termination_mode = termination_mode
         
         # Hyperparameters
         self.eps_init = eps_init
         self.eps_fin = eps_fin
         self.eps_dec = eps_dec
         self.eps = eps_init
+        
+        # Best reward tracking via deterministic evaluation
+        self.best_eval_avg_reward = -np.inf
+        self.best_eval_agent_reward = {i: -np.inf for i in range(num_agents)}
+
+        if self.train_all_mode not in (1, 2):
+            raise ValueError("train_all_mode must be 1 or 2")
+        if self.train_all_mode == 2 and self.rotation_episodes <= 0:
+            raise ValueError("rotation_episodes must be greater than 0 when train_all_mode is 2")
+        if self.total_steps is not None and self.total_steps <= 0:
+            raise ValueError("total_steps must be greater than 0 when provided")
+
+        np.random.seed(self.rng_seed)
+        th.manual_seed(self.rng_seed)
+        if th.cuda.is_available():
+            th.cuda.manual_seed_all(self.rng_seed)
         
         os.makedirs(self.save_path, exist_ok=True)
         
@@ -133,42 +168,67 @@ class SB3_MAS_Train:
         else:
             from stable_baselines3.common.vec_env import DummyVecEnv
             lr_schedule = self._linear_lr_schedule(self.ppo_initial_lr, self.ppo_final_lr)
+
+            # Build policy_kwargs: use CrossAttentionExtractor when requested.
+            if self.use_cross_attention:
+                import sys, os as _os
+                # cross_attention_extractor.py lives alongside custom_environment.py
+                # in the aggregated_states/ sub-package directory.
+                _attn_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "aggregated_states")
+                if _attn_dir not in sys.path:
+                    sys.path.insert(0, _attn_dir)
+                from cross_attention_extractor import CrossAttentionExtractor
+                policy_kwargs = dict(
+                    features_extractor_class=CrossAttentionExtractor,
+                    features_extractor_kwargs=dict(
+                        max_agents=self.max_agents,
+                        d_model=self.attn_d_model,
+                    ),
+                )
+            else:
+                policy_kwargs = {}
+
             self.models = {}
             for i in range(num_agents):
                 if self.num_envs > 1:
-                    # Each sub-env gets its own deepcopy so DummyVecEnv's
-                    # internal reset() calls don't corrupt eval_env's state
-                    # (episode counter, irradiance index, etc.)
                     sub_envs = [copy.deepcopy(self.eval_env) for _ in range(self.num_envs)]
                     venv = DummyVecEnv([(lambda e=sub_envs[j], ag=i: EnvWrapper(e, ag))
                                         for j in range(self.num_envs)])
                 else:
                     venv = EnvWrapper(self.eval_env, i)
-                
+
                 self.models[i] = PPO(
                     "MlpPolicy",
                     venv,
                     learning_rate=lr_schedule,
-                    n_steps=512,
+                    n_steps=self.ppo_n_steps,
                     batch_size=batch_size,
                     n_epochs=10,
                     verbose=0,
                     device=device,
+                    policy_kwargs=policy_kwargs if policy_kwargs else None,
                 )
 
         for i in range(num_agents):
             self.models[i].set_logger(configure(None, ["stdout", "csv"]))
 
     def decode(self, action):
-        # Handle potential array/tensor shapes
-        if hasattr(action, 'flatten'):
-            action = action.flatten()[0]
-        elif isinstance(action, (list, np.ndarray)):
-            action = action[0]
-        
-        action = int(action)
-        fti = action % 21
-        rem = action // 21
+        """
+        Decode an action from the policy.
+        For PPO with MultiDiscrete([proc_rate+1, 3, num_agents, proc_rate+1]):
+          action is an array [fti, oti, target, off_rate]
+        For DQN with a legacy flat-integer encoding, falls back to modular arithmetic.
+        """
+        action = np.array(action).flatten()
+
+        if len(action) == 4:
+            # MultiDiscrete: [fti, oti, target, off_rate] — use directly
+            return [float(action[0]), int(action[1]), int(action[2]), float(action[3])]
+
+        # Legacy flat-integer encoding (DQN)
+        a = int(action[0])
+        fti = a % 21
+        rem = a // 21
         oti = rem % 3
         rem = rem // 3
         target = rem % self.num_agents
@@ -183,14 +243,337 @@ class SB3_MAS_Train:
 
         return schedule
 
+    @staticmethod
+    def _seed_to_int(seed):
+        if isinstance(seed, (int, np.integer)):
+            return int(seed)
+        if seed is None:
+            return 0
+        seed_text = str(seed).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(seed_text).digest()[:4], byteorder="little", signed=False)
+
+    def _sample_or_policy_action(self, agent_id, obs, use_policy, deterministic=False):
+        if not use_policy:
+            action = self.models[agent_id].action_space.sample()
+            return action, None, None
+
+        if self.algo == "DQN":
+            action, _ = self.models[agent_id].predict(obs, deterministic=deterministic)
+            return action, None, None
+
+        obs_tensor = th.as_tensor(obs).to(self.models[agent_id].device).unsqueeze(0)
+        with th.no_grad():
+            action, value, log_prob = self.models[agent_id].policy(obs_tensor)
+        return action.cpu().numpy()[0], value, log_prob
+
+    def _increment_total_steps(self, step_increment=1):
+        if self.total_steps is None:
+            return False
+
+        self.total_steps_done += step_increment
+        return self.total_steps_done >= self.total_steps
+
+    def _run_evaluation(self):
+        obs, _ = self.eval_env.reset(seed=self.seed)
+        done = False
+        eval_rewards = {i: 0.0 for i in range(self.num_agents)}
+        while not done:
+            actions = {}
+            for agent_id in range(self.num_agents):
+                # Deterministic prediction for evaluation
+                action, _ = self.models[agent_id].predict(obs[agent_id], deterministic=True)
+                actions[agent_id] = self.decode(action)
+
+            next_obs, rewards, terminations, truncations, _ = self.eval_env.step(actions)
+            
+            for agent_id in range(self.num_agents):
+                eval_rewards[agent_id] += rewards[agent_id]
+
+            if self.termination_mode == "penalty":
+                done = all(truncations.values())
+            else:
+                done = any(terminations.values()) or all(truncations.values())
+            obs = next_obs
+
+        return eval_rewards
+
+    def _train_rotating(self):
+        use_parallel = self.algo == "PPO" and self.num_envs > 1
+        n = self.num_envs if use_parallel else 1
+        env_handle = self.env if use_parallel else self.rotating_env
+
+        print(
+            f"Starting {self.algo} Training in rotating mode for {self.num_episodes} episodes "
+            f"({'parallel ' + str(n) + ' envs' if use_parallel else 'single env'})..."
+        )
+
+        rewards_history = {i: [] for i in range(self.num_agents)}
+        steps_history = []
+        trained_agents = set()
+        active_agent = 0
+        episodes_in_rotation = 0
+        stop_training = False
+
+        for ep in range(self.num_episodes):
+            if stop_training:
+                break
+
+            obs_list, _ = env_handle.reset(seed=self.seed)
+            # Normalise: single-env reset returns a dict; multi-env returns a list of dicts.
+            # We work with obs_list always being a list of length n.
+            if not use_parallel:
+                obs_list = [obs_list]   # wrap single dict into a list
+
+            done = False
+            ep_reward = {i: 0.0 for i in range(self.num_agents)}
+            step_count = 0
+
+            while not done:
+                # -------------------------------------------------------------------
+                # Collect actions for every env in the batch
+                # -------------------------------------------------------------------
+                # For PPO active agent: batch inference over all n envs at once.
+                # For DQN / single-env: keep the original per-step logic.
+                actions_list = [{} for _ in range(n)]   # decoded actions per env
+
+                if use_parallel:
+                    # ---- active agent: batch forward pass ----
+                    obs_active = np.stack([obs_list[k][active_agent] for k in range(n)])
+                    obs_tensor = th.as_tensor(obs_active).to(self.models[active_agent].device)
+                    with th.no_grad():
+                        act_batch, value_batch, lp_batch = self.models[active_agent].policy(obs_tensor)
+                    act_batch_np = act_batch.cpu().numpy()   # (n, action_dim)
+
+                    self.models[active_agent]._last_obs    = obs_active
+                    self.models[active_agent]._last_value  = value_batch
+                    self.models[active_agent]._last_log_prob = lp_batch
+
+                    for k in range(n):
+                        actions_list[k][active_agent] = self.decode(act_batch_np[k])
+
+                    # ---- other agents: random or deterministic policy, per env ----
+                    for agent_id in range(self.num_agents):
+                        if agent_id == active_agent:
+                            continue
+                        use_pol = agent_id in trained_agents
+                        obs_other = np.stack([obs_list[k][agent_id] for k in range(n)])
+                        if use_pol:
+                            obs_t = th.as_tensor(obs_other).to(self.models[agent_id].device)
+                            with th.no_grad():
+                                act_o, _, _ = self.models[agent_id].policy(obs_t)
+                            act_o_np = act_o.cpu().numpy()
+                            for k in range(n):
+                                actions_list[k][agent_id] = self.decode(act_o_np[k])
+                        else:
+                            for k in range(n):
+                                rnd = self.models[agent_id].action_space.sample()
+                                actions_list[k][agent_id] = self.decode(rnd)
+
+                    # ---- step all envs ----
+                    next_obs_list, rew_list, term_list, trunc_list, _ = env_handle.step(actions_list)
+
+                    # ---- accumulate rewards (track env-0 for logging) ----
+                    for agent_id in range(self.num_agents):
+                        ep_reward[agent_id] += rew_list[0][agent_id]
+
+                    # ---- PPO rollout buffer update (active agent, n transitions) ----
+                    rewards_arr  = np.array([rew_list[k][active_agent]  for k in range(n)])
+                    is_done_arr  = np.array([
+                        term_list[k][active_agent] or trunc_list[k][active_agent]
+                        for k in range(n)
+                    ])
+                    episode_starts = np.array([step_count == 0] * n)
+
+                    # act_batch shape (n, action_dim) → rollout buffer expects (n, action_dim)
+                    action_buf = act_batch_np  # already (n, action_dim)
+
+                    self.models[active_agent].rollout_buffer.add(
+                        obs_active,
+                        action_buf,
+                        rewards_arr,
+                        episode_starts,
+                        value_batch,
+                        lp_batch,
+                    )
+                    self.models[active_agent].num_timesteps += n
+                    stop_training = self._increment_total_steps(n)
+
+                    if self.models[active_agent].rollout_buffer.full:
+                        next_obs_active = np.stack([next_obs_list[k][active_agent] for k in range(n)])
+                        last_obs_t = th.as_tensor(next_obs_active).to(self.models[active_agent].device)
+                        with th.no_grad():
+                            last_val = self.models[active_agent].policy.predict_values(last_obs_t).flatten()
+                        self.models[active_agent].rollout_buffer.compute_returns_and_advantage(
+                            last_val, is_done_arr
+                        )
+                        progress = 1.0 - (ep / self.num_episodes)
+                        self.models[active_agent]._current_progress_remaining = progress
+                        self.models[active_agent].train()
+                        self.models[active_agent].rollout_buffer.reset()
+
+                    obs_list = next_obs_list
+                    done = (
+                        any(term_list[0].values()) or all(trunc_list[0].values())
+                        or stop_training
+                    )
+
+                else:
+                    # -----------------------------------------------------------
+                    # Single-env path (original logic, kept intact)
+                    # -----------------------------------------------------------
+                    obs = obs_list[0]   # plain dict
+                    actions_encoded = {}
+                    actions = {}
+
+                    for agent_id in range(self.num_agents):
+                        if agent_id == active_agent:
+                            if self.algo == "DQN":
+                                if np.random.rand() < self.eps:
+                                    act = self.models[agent_id].action_space.sample()
+                                else:
+                                    act, _ = self.models[agent_id].predict(obs[agent_id], deterministic=False)
+                                value = None
+                                log_prob = None
+                            else:
+                                obs_tensor = th.as_tensor(obs[agent_id]).to(self.models[agent_id].device).unsqueeze(0)
+                                with th.no_grad():
+                                    act, value, log_prob = self.models[agent_id].policy(obs_tensor)
+                                act = act.cpu().numpy()[0]
+
+                            actions_encoded[agent_id] = act
+                            actions[agent_id] = self.decode(act)
+                            self.models[agent_id]._last_value   = value
+                            self.models[agent_id]._last_log_prob = log_prob
+                            self.models[agent_id]._last_obs     = obs[agent_id]
+                        elif agent_id in trained_agents:
+                            act, _, _ = self._sample_or_policy_action(agent_id, obs[agent_id], use_policy=True, deterministic=True)
+                            actions_encoded[agent_id] = act
+                            actions[agent_id] = self.decode(act)
+                        else:
+                            act, _, _ = self._sample_or_policy_action(agent_id, obs[agent_id], use_policy=False)
+                            actions_encoded[agent_id] = act
+                            actions[agent_id] = self.decode(act)
+
+                    next_obs, rewards, terminations, truncations, _ = self.rotating_env.step(actions)
+
+                    for agent_id in range(self.num_agents):
+                        ep_reward[agent_id] += rewards[agent_id]
+
+                    if self.algo == "DQN":
+                        is_done = terminations[active_agent] or truncations[active_agent]
+                        self.models[active_agent].replay_buffer.add(
+                            obs[active_agent],
+                            next_obs[active_agent],
+                            np.array([actions_encoded[active_agent]]),
+                            rewards[active_agent],
+                            is_done,
+                            [{}],
+                        )
+                        if self.models[active_agent].num_timesteps > 1000 and self.models[active_agent].num_timesteps % self.train_freq == 0:
+                            self.models[active_agent].train(gradient_steps=1, batch_size=self.batch_size)
+                    else:
+                        self.models[active_agent].rollout_buffer.add(
+                            self.models[active_agent]._last_obs,
+                            np.array([actions_encoded[active_agent]]),
+                            rewards[active_agent],
+                            np.array([step_count == 0]),
+                            self.models[active_agent]._last_value,
+                            self.models[active_agent]._last_log_prob,
+                        )
+                        if self.models[active_agent].rollout_buffer.full:
+                            last_obs_t = th.as_tensor(next_obs[active_agent]).to(self.models[active_agent].device).unsqueeze(0)
+                            with th.no_grad():
+                                last_val = self.models[active_agent].policy.predict_values(last_obs_t)
+                            self.models[active_agent].rollout_buffer.compute_returns_and_advantage(
+                                last_val,
+                                np.array([terminations[active_agent] or truncations[active_agent]]),
+                            )
+                            progress = 1.0 - (ep / self.num_episodes)
+                            self.models[active_agent]._current_progress_remaining = progress
+                            self.models[active_agent].train()
+                            self.models[active_agent].rollout_buffer.reset()
+
+                    self.models[active_agent].num_timesteps += 1
+                    stop_training = self._increment_total_steps()
+
+                    obs_list = [next_obs]
+                    if self.termination_mode == "penalty":
+                        # Episode ends ONLY at max_steps.
+                        # Dead agents are penalised per-step by the environment.
+                        done = all(truncations.values()) or stop_training
+                    else:
+                        # "early": original behaviour — any death ends the episode.
+                        done = (
+                            any(terminations.values()) or all(truncations.values())
+                            or stop_training
+                        )
+
+                step_count += 1
+
+            # ---- end-of-episode bookkeeping ----
+            _episode_active_agent = active_agent   # capture before possible rotation
+            episodes_in_rotation += 1
+            if episodes_in_rotation >= self.rotation_episodes:
+                trained_agents.add(active_agent)
+                active_agent = (active_agent + 1) % self.num_agents
+                episodes_in_rotation = 0
+
+            self.eps = max(self.eps_fin, self.eps_init - ep * (self.eps_init - self.eps_fin) / (self.num_episodes * self.eps_dec))
+
+            steps_history.append(step_count)
+            for agent_id in range(self.num_agents):
+                rewards_history[agent_id].append(ep_reward[agent_id])
+
+            # ---- Periodic Deterministic Evaluation (mode=2) ----
+            if ep % 20 == 0 or ep == self.num_episodes - 1:
+                eval_rewards = self._run_evaluation()
+                eval_avg_reward = np.mean(list(eval_rewards.values()))
+                
+                # Update global average
+                if eval_avg_reward > self.best_eval_avg_reward:
+                    self.best_eval_avg_reward = eval_avg_reward
+                
+                # Check for personal bests
+                for agent_idx in range(self.num_agents):
+                    if eval_rewards[agent_idx] > self.best_eval_agent_reward[agent_idx]:
+                        self.best_eval_agent_reward[agent_idx] = eval_rewards[agent_idx]
+                        self.save_models(ep, eval_rewards[agent_idx], agent_id=agent_idx)
+                
+                print(f"--- Eval Ep {ep}: Det. Rewards: {eval_rewards} | Avg: {eval_avg_reward:.2f} ---")
+
+            if ep % 20 == 0:
+                last_obs = obs_list[0]
+                print(
+                    f"Ep {ep}/{self.num_episodes} | active={_episode_active_agent} | "
+                    f"trained={sorted(trained_agents)} | Steps: {step_count} | "
+                    f"Rewards: {ep_reward} | "
+                    f"Obs: {[last_obs[i].tolist() for i in range(self.num_agents)]}"
+                )
+
+        # Final snapshot: ensure every agent has at least one saved checkpoint.
+        print("Saving final model snapshot for all agents...")
+        self.save_models(episode=self.num_episodes - 1)
+
+        self.plot_results(rewards_history, steps_history)
+
+        if use_parallel:
+            self.env.close()
+
     def train(self):
+        if self.train_all_mode == 2:
+            self._train_rotating()
+            return
+
         print(f"Starting {self.algo} Training for {self.num_episodes} episodes...")
         
         rewards_history = {i: [] for i in range(self.num_agents)}
         steps_history = []
         
         for ep in range(self.num_episodes):
-            obs, info = self.env.reset()
+            if self.total_steps is not None and self.total_steps_done >= self.total_steps:
+                break
+
+            obs, info = self.env.reset(seed=self.seed)
             done = False
             ep_reward = {i: 0 for i in range(self.num_agents)}
             step_count = 0
@@ -241,6 +624,11 @@ class SB3_MAS_Train:
                             actions_list[env_idx][i] = self.decode(act[env_idx])
                             
                     next_obs, rewards, terminations, truncations, infos = self.env.step(actions_list)
+
+                if self.num_envs == 1:
+                    stop_training = self._increment_total_steps()
+                else:
+                    stop_training = self._increment_total_steps(self.num_envs)
                 
                 for i in range(self.num_agents):
                     if self.num_envs == 1:
@@ -308,11 +696,25 @@ class SB3_MAS_Train:
                 
                 obs = next_obs
                 step_count += 1
+
+                if self.total_steps is not None and stop_training:
+                    done = True
                 
                 if self.num_envs == 1:
-                    done = any(terminations.values()) or all(truncations.values())
+                    if self.termination_mode == "penalty":
+                        # Episode ends ONLY at max_steps.
+                        done = all(truncations.values())
+                    else:
+                        # "early": original behaviour.
+                        done = any(terminations.values()) or all(truncations.values())
                 else:
-                    done = any(terminations[0].values()) or all(truncations[0].values())
+                    if self.termination_mode == "penalty":
+                        done = all(truncations[0].values())
+                    else:
+                        done = any(terminations[0].values()) or all(truncations[0].values())
+
+                if self.total_steps is not None and stop_training:
+                    done = True
 
             # Update epsilon for DQN
             self.eps = max(self.eps_fin, self.eps_init - ep * (self.eps_init - self.eps_fin) / (self.num_episodes * self.eps_dec))
@@ -321,43 +723,63 @@ class SB3_MAS_Train:
             for i in range(self.num_agents):
                 rewards_history[i].append(ep_reward[i])
             
+            # ---- Periodic Deterministic Evaluation (mode=1) ----
+            if ep % 10 == 0 or ep == self.num_episodes - 1:
+                eval_rewards = self._run_evaluation()
+                eval_avg_reward = np.mean(list(eval_rewards.values()))
+                
+                # Save models if this is the best deterministic evaluation reward so far.
+                if eval_avg_reward > self.best_eval_avg_reward:
+                    self.best_eval_avg_reward = eval_avg_reward
+                    self.save_models(ep, eval_avg_reward)
+                    
+                print(f"--- Eval Ep {ep}: Det. Rewards: {eval_rewards} | Avg: {eval_avg_reward:.2f} ---")
+
             if ep % 20 == 0:
                 if self.num_envs == 1:
-                    print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Rewards: {ep_reward} - Obs: {[obs[i].tolist() for i in range(self.num_agents)]}")
+                    print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Obs: {[obs[i].tolist() for i in range(self.num_agents)]}")
                 else:
-                    print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Rewards: {ep_reward} - Obs: {[obs[0][i].tolist() for i in range(self.num_agents)]}")
-            
-            if ep % 500 == 0:
-                self.save_models()
+                    print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Obs: {[obs[0][i].tolist() for i in range(self.num_agents)]}")
                 
         if self.num_envs > 1:
             self.env.close()
-            
-        self.save_models()
 
-    def save_models(self):
-        for i in range(self.num_agents):
-            self.models[i].save(os.path.join(self.save_path, f"agent_{i}"))
+    def save_models(self, episode=None, avg_reward=None, agent_id=None):
+        """
+        Save model checkpoints.
+        - agent_id=int  → per-agent personal best (mode=2): writes agent_{i}_best.zip (overwrite)
+        - agent_id=None → all agents (mode=1 / end-of-training): writes agent_{i}_final.zip (overwrite)
+          and, when avg_reward is provided, also updates agent_{i}_best.zip.
+        Only agent_{i}_best.zip is used by evaluate().
+        """
+        agents_to_save = [agent_id] if agent_id is not None else range(self.num_agents)
+        for i in agents_to_save:
+            fname = os.path.join(self.save_path, f"agent_{i}_best")
+            self.models[i].save(fname)
+
+        print(f"Saved Agent: {list(agents_to_save)} | reward: {avg_reward:.4f}] | in: {self.save_path}")
 
     def _load_latest_model_for_agent(self, agent_id):
         model_dir = Path(self.save_path)
-        pattern = f"agent_{agent_id}*.zip"
-        file_py = list(model_dir.glob(pattern))
 
-        if not file_py:
+        # Prefer agent_{i}_best.zip. Evaluation must use the best checkpoint
+        # found during training, not the last saved snapshot.
+        best_file = model_dir / f"agent_{agent_id}_best.zip"
+        if best_file.exists():
+            chosen = best_file
+        else:
             return False
 
-        most_recent = max(file_py, key=lambda f: f.stat().st_mtime)
-        print(f"Loading agent {agent_id}: {most_recent}")
+        print(f"Loading agent {agent_id}: {chosen}")
 
-        wrapped_env = EnvWrapper(self.eval_env, agent_id)
-
+        # Do NOT pass env= to load(): SB3 would validate the action space against
+        # the current environment, which fails if num_agents changed between runs.
+        # For evaluation we only call model.predict(), so env binding is unnecessary.
+        device = "cuda" if th.cuda.is_available() else "cpu"
         if self.algo == "DQN":
-            model = DQN.load(str(most_recent), env=wrapped_env)
+            model = DQN.load(str(chosen), device=device)
         else:
-            # Use env= directly in load() to avoid n_envs mismatch
-            # (model was trained with num_envs>1 but evaluation uses 1 env)
-            model = PPO.load(str(most_recent), env=wrapped_env)
+            model = PPO.load(str(chosen), device=device)
 
         self.models[agent_id] = model
         return True
@@ -372,7 +794,9 @@ class SB3_MAS_Train:
                 batt = int(self.battery_capacities[i])
                 print(f"No saved model found for agent {i} ({batt}Wh), keeping fresh model")
         
-        obs = self.eval_env.reset(self.random_seed)[0]
+        # Reset eval_env with the configured seed (fixed_winter=355, fixed_summer=172, linear=next)
+        obs, _ = self.eval_env.reset(seed=self.seed)
+        print(f"Evaluating on episode {self.eval_env.episode} (seed='{self.seed}')")
         agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": [], "reward": []} for agent_id in range(self.num_agents)}
         terminate = False
         total_rewards = {i: 0 for i in range(self.num_agents)}
@@ -394,6 +818,7 @@ class SB3_MAS_Train:
                 agents_logs[agent_id]["processing"].append(actions[agent_id][0]/20)
                 agents_logs[agent_id]["backlog"].append(obs[agent_id][1])
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
+                agents_logs[agent_id]["state"].append(actions[agent_id][1])
 
                 done = terminations[agent_id] or truncations[agent_id]
                 if done:
@@ -414,6 +839,7 @@ class SB3_MAS_Train:
             plt.plot(agents_logs[agent_id]['processing'], label='Processing Decision')
             plt.plot(agents_logs[agent_id]['panel_energy'], label='Panel Energy')
             plt.plot(agents_logs[agent_id]['backlog'], label='Backlog')
+            plt.plot(agents_logs[agent_id]['state'], label='State')
             #plt.plot(agents_logs[agent_id]['reward'], label='Reward')
 
             # Color area when battery is 0
@@ -439,6 +865,7 @@ class SB3_MAS_Train:
 
         print("Total processed frames during evaluation:", self.eval_env.total_frames_processed)
         print("Total rewards during evaluation:", total_rewards)
+        print("Total transferred frames during evaluation:", self.eval_env.total_transferred_frames)
         
         print("\n--- Total Solar Energy Accumulated ---")
         episode = self.eval_env.episode

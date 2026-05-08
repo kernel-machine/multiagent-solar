@@ -4,7 +4,6 @@ import functools
 from pettingzoo import ParallelEnv
 from gymnasium import spaces
 import numpy as np
-import jit_reward_function as jrf
 import interpol as ip
 from copy import copy
 
@@ -61,6 +60,7 @@ class BaseEnvironment(ParallelEnv):
         self.episode = 1
         self._w = w
         self.total_frames_processed = 0
+        self.total_transferred_frames = 0
 
         try:
             self.max_steps = int(24 * 60 * 60 / proc_interval)
@@ -70,98 +70,6 @@ class BaseEnvironment(ParallelEnv):
         self.fs = [0 for i in range(0, self._num_agents)]
         self.hs = [0 for i in range(0, self._num_agents)]
         self.hs_counter = [0 for i in range(0, self._num_agents)] # Message exchange counter for each agent, used for logging purposes
-        
-    def calculate_reward_locally(self, agent_id):
-        fti = self.actions[agent_id][0]
-        xti = self.actions[agent_id][1]
-        gti = self.actions[agent_id][2]
-        hti = self.actions[agent_id][3]
-                
-        ft_gti = self.actions[gti][0]
-        xt_gti = self.actions[gti][1]
-        gt_gti = self.actions[gti][2]
-        ht_gti = self.actions[gti][3]
-        
-        idx = (self.episode * self.max_steps) + self.timestep
-        # print(idx)
-        irradiance = self.irradiance_arrays[agent_id][idx]
-        self.irradiance_level[agent_id] = self.irradiance_arrays[agent_id][idx] / self.max_irrad
-        
-        fti = self.actions[agent_id][0]
-    
-        idx = (self.episode * self.max_steps) + self.timestep
-        irradiance = self.irradiance_arrays[agent_id][idx]
-        
-        panel_energy = irradiance * self.panel_surfaces[agent_id] * self.panel_efficiency * self._proc_interval
-        actual_battery = self.battery_energies[agent_id] + panel_energy
-        backlog = self.backlogs[agent_id]
-        
-        processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_frame), self._processing_rate * self._proc_interval), 0)
-        needed_energy = (fti * self._proc_interval * self.e_frame) + self.e_idle
-        
-        return jrf.jit_calculate_reward_local(fti,
-                                   xti,
-                                   gti,
-                                   hti,
-                                   ft_gti,
-                                   xt_gti,
-                                   gt_gti,
-                                   ht_gti,
-                                   irradiance,
-                                   self.panel_surfaces[agent_id],
-                                   self.panel_efficiency,
-                                   self.backlogs[agent_id],
-                                   self.backlogs[gti],
-                                   self.e_idle,
-                                   self.e_frame,
-                                   self.e_tx_rx,
-                                   self.battery_energies[agent_id],
-                                   self.battery_capacities[agent_id],
-                                   self._processing_rate,
-                                   self._proc_interval,
-                                   agent_id
-                                   )
-    
-    def calculate_reward_offloading(self, agent_id):
-        fti = self.actions[agent_id][0]
-        xti = self.actions[agent_id][1]
-        gti = self.actions[agent_id][2]
-        hti = self.actions[agent_id][3]
-                
-        ft_gti = self.actions[gti][0]
-        xt_gti = self.actions[gti][1]
-        gt_gti = self.actions[gti][2]
-        ht_gti = self.actions[gti][3]
-        
-        idx = (self.episode * self.max_steps) + self.timestep
-        # print(idx)
-        irradiance = self.irradiance_arrays[agent_id][idx]
-        self.irradiance_level[agent_id] = self.irradiance_arrays[agent_id][idx] / self.max_irrad
-        
-        return jrf.jit_calculate_reward_offloading(fti,
-                                   xti,
-                                   gti,
-                                   hti,
-                                   ft_gti,
-                                   xt_gti,
-                                   gt_gti,
-                                   ht_gti,
-                                   irradiance,
-                                   self.panel_surfaces[agent_id],
-                                   self.panel_efficiency,
-                                   self.backlogs[agent_id],
-                                   self.backlogs[gti],
-                                   self.e_idle,
-                                   self.e_frame,
-                                   self.e_tx_rx,
-                                   self.battery_energies[agent_id],
-                                   self.battery_capacities[agent_id],
-                                   self._processing_rate,
-                                   self._proc_interval,
-                                   self._arrival_rate,
-                                   agent_id,
-                                   self._w
-                                   )
 
         
     def update_states_offloading(self):
@@ -189,32 +97,19 @@ class BaseEnvironment(ParallelEnv):
             offloading_processing = 0
 
             
-            if remaining_framerate > 0 and xti != 0:
-                if(xti == 1 and gti != agent_id and hti > 0 and xt_gti == 2 and gt_gti == agent_id and ht_gti > 0 and self.backlogs[gti] <= (self._arrival_rate * self._proc_interval)):
-                    # Sender mode
-                    ht = min(hti, ht_gti)
+            if remaining_framerate > 0 and xti == 0 and hti > 0:
+                # 2-state semantics: xti is a receive flag only.
+                # The sender stays in non-receive mode and the target must be in receive mode.
+                if(gti != agent_id and xt_gti == 1 and gt_gti == agent_id and self.backlogs[gti] <= (self._arrival_rate * self._proc_interval)):
+                    ht = hti
                     backlog = self.backlogs[agent_id]
-                    
+
                     processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_tx_rx), remaining_framerate * self._proc_interval), 0)
                     processed = min(ht * self._proc_interval, processable)
                     needed_energy = ht * self.e_tx_rx * self._proc_interval
-                    
+
                     if(needed_energy <= actual_battery and processable > 0):
                         self.backlogs[agent_id] = max(backlog - processed, 0)
-                        actual_battery = max(actual_battery - needed_energy, 0)
-                        offloading_processing = processed / self._proc_interval
-                        self.hs_counter[agent_id] += 1
-                
-                if(xti == 2 and gti != agent_id and hti > 0 and xt_gti == 1 and gt_gti == agent_id and ht_gti > 0 and self.backlogs[agent_id] <= (self._arrival_rate * self._proc_interval)):
-                    # Receiver mode
-                    ht = min(hti, ht_gti)
-                    backlog = self.backlogs[gti]
-                    
-                    processable = max(min(backlog, int((actual_battery - self.e_idle) / (self.e_tx_rx + self.e_frame)), remaining_framerate * self._proc_interval), 0)
-                    processed = min(ht * self._proc_interval, processable)
-                    needed_energy = ht * (self.e_tx_rx + self.e_frame) * self._proc_interval
-                    
-                    if(needed_energy <= actual_battery and processable > 0):
                         actual_battery = max(actual_battery - needed_energy, 0)
                         offloading_processing = processed / self._proc_interval
                         self.hs_counter[agent_id] += 1
@@ -261,7 +156,9 @@ class BaseEnvironment(ParallelEnv):
                 self.backlogs[agent_id] = self.max_storage
                 rewards[agent_id] = -difference
 
-        # Local state update (inlined from update_states_locally)
+        # Local state update
+        # Dead-agent penalty per step: all frames that arrived but cannot be processed.
+        _dead_penalty = self._arrival_rate * self._proc_interval  # unnormalized, same scale as rewards
         terminations = {}
         for agent_id in range(0, self._num_agents):
             fti = actions[agent_id][0]
@@ -270,43 +167,65 @@ class BaseEnvironment(ParallelEnv):
             panel_energy = self.irradiance_level[agent_id] * self.max_irrad * self.panel_surfaces[agent_id] * self._proc_interval * self.panel_efficiency
 
             actual_battery = self.battery_energies[agent_id] + panel_energy
-            backlog = self.backlogs[agent_id]
 
             #processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_frame), self._processing_rate * self._proc_interval), 0)
             processed_images = fti * self._proc_interval
-            processed_images = min(processed_images, backlog)
+            processed_images = min(processed_images, self.backlogs[agent_id])
             needed_energy = (processed_images * self.e_frame) + self.e_idle
 
             local_processing = 0
             if actual_battery > needed_energy:
                 self.total_frames_processed += processed_images
-                backlog = max(backlog - processed_images, 0)
+                self.backlogs[agent_id] = max(self.backlogs[agent_id] - processed_images, 0)
                 local_processing = processed_images / self._proc_interval
                 
-                rewards[agent_id] =  processed_images
-                terminations[agent_id] = False
+                rewards[agent_id] = rewards.get(agent_id, 0) + processed_images
             else:
-                rewards[agent_id] = -processed_images - backlog
-                terminations[agent_id] = True
+                rewards[agent_id] = rewards.get(agent_id, 0) - processed_images - self.backlogs[agent_id]
 
             actual_battery = max(actual_battery - needed_energy, 0)
 
-
-            if backlog > self.max_storage:
-                backlog_difference = backlog - self.max_storage
-                rewards[agent_id] -= backlog_difference
-                backlog = self.max_storage
-
-            #print(f"Agent {agent_id} - IDX: {idx} - rewards: {rewards[agent_id]} - Batt: {actual_battery} - Proc: {processable} - Actions: {actions[agent_id]}")
-            rewards[agent_id] /= (self._processing_rate * self._proc_interval)
             self.battery_energies[agent_id] = min(actual_battery, self.battery_capacities[agent_id])
-            self.backlogs[agent_id] = backlog
             self.fs[agent_id] += local_processing
 
-        # update_states_offloading calculate offloading processing and energy penalty
-        #self.update_states_offloading()
+            off_rate = actions[agent_id][3]          # index 3 = off_rate
+            target   = int(actions[agent_id][2])     # index 2 = target agent
+            offloaded_images = off_rate * self._proc_interval
+            if off_rate > 0 and target != agent_id and self.backlogs[agent_id] > 0:
+                # 2-state semantics: 0 = not receiving, 1 = receiving.
+                # The sender must be in non-receive mode, the target must be in receive mode.
+                if actions[agent_id][1] == 0 and actions[target][1] == 1: #Rewards handshaking
+                    rewards[agent_id] += 0.2*offloaded_images
+                    needed_energy = offloaded_images * self.e_tx_rx# * self._proc_interval
+                    if self.battery_energies[agent_id] > needed_energy:
+                        self.backlogs[agent_id] = max(self.backlogs[agent_id] - offloaded_images, 0)
+                        self.backlogs[target] += offloaded_images
+                        if self.backlogs[target] > self.max_storage:
+                            diff = self.backlogs[target] - self.max_storage
+                            real_images = offloaded_images - diff
+                            self.backlogs[target] = self.max_storage
+                            rewards[agent_id] += 0.5*real_images
+                        else:
+                            rewards[agent_id] += 0.5*offloaded_images
+                        self.total_transferred_frames += offloaded_images
+                    else: # Not enough energy to transmit
+                        rewards[agent_id] -= 0.5*offloaded_images
+                    self.battery_energies[agent_id] = max(self.battery_energies[agent_id] - needed_energy, 0)
+                else: # Wrong target or sender still in receive mode
+                    rewards[agent_id] -= 0.5*offloaded_images
+        
+        # Penalize buffer overflow
+        for agent_id in range(0, self._num_agents):
+            if self.backlogs[agent_id] > self.max_storage:
+                backlog_difference = self.backlogs[agent_id] - self.max_storage
+                rewards[agent_id] -= backlog_difference
+                self.backlogs[agent_id] = self.max_storage
+
+        # Normalize rewards
+        rewards = {a: rewards[a] / (self._processing_rate * self._proc_interval) for a in self.agents}
         
         truncations = {a: False for a in self.agents}
+        terminations = {a: self.battery_energies[a] <= 0 for a in self.agents}
                 
         if(self.timestep == (self.max_steps - 1)):
             truncations = {a: True for a in self.agents}
@@ -336,6 +255,7 @@ class BaseEnvironment(ParallelEnv):
         self.battery_energies = [(self.battery_capacities[i] * 0.5) for i in range(0, self._num_agents)]
         self.backlogs = [0 for i in range(0, self._num_agents)]
         self.total_frames_processed = 0
+        self.total_transferred_frames = 0
 
         self.fs = [0 for i in range(0, self._num_agents)]
         self.hs = [0 for i in range(0, self._num_agents)]
