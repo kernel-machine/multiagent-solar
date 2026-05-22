@@ -43,7 +43,7 @@ class SB3_MAS_Train:
         self.irradiance_data = []
         self.irradiance_arrays = []
         # Battery starts at 50% of its capacity
-        day = 355
+        day = 0
         for filepath in self.irradiance_datapaths:
             # print(filepath, delta_time, proc_interval)
             df = ip.interpolate(filepath, delta_time, proc_interval)
@@ -58,8 +58,7 @@ class SB3_MAS_Train:
         B = cp.Variable((N, T+1), nonneg=True)
         E = cp.Variable((N, T+1))
         spill = cp.Variable((N, T), nonneg=True)       
-        # SLACK REMOVED — forces strict E >= 0 like RL environment
-        # slack = cp.Variable((N, T), nonneg=True)
+        #slack = cp.Variable((N, T+1), nonneg=True)
         y = cp.Variable((N, N, T), boolean=True) # Unicast transmission indicator
         
         self.Eharv = np.array(self.irradiance_arrays) # (N, T)
@@ -75,8 +74,13 @@ class SB3_MAS_Train:
         E0_vec = np.array(self.battery_capacities_wh) * 0.5 * 3600
         constraints += [E[:, 0] == E0_vec]
 
-        constraints += [E >= 0]
+        # Hard physical limit (battery energy cannot be negative)
         constraints += [E <= np.array(self.battery_capacities_wh).reshape(-1, 1)*3600]
+
+        # Soft safety threshold constraint (15% capacity, matching the 0.15 threshold in the RL environment)
+        battery_threshold_ratio = 0.001
+        min_E = np.array(self.battery_capacities_wh).reshape(-1, 1) * 3600 * battery_threshold_ratio
+        constraints += [E >= min_E]
 
         # Set upper bound for x
         UB = self.proc_rate * self.proc_interval_s
@@ -128,10 +132,13 @@ class SB3_MAS_Train:
         SPILL_PENALTY = 1e-3
         EPSILON_OBJ = 1e-6
 
+        SLACK_PENALTY = 100.0  # Strongly penalize dropping below 15% safety threshold
+
         objective = cp.Maximize(
             processed_total
             - EPSILON_OBJ * tx_total
             - SPILL_PENALTY * cp.sum(spill)
+            #- SLACK_PENALTY * cp.sum(slack)
         )
         self.x = x
         self.prob = cp.Problem(objective, constraints)
@@ -165,7 +172,7 @@ class SB3_MAS_Train:
             
             irradiance = self.Eharv[agent_id, :] * self.proc_interval_s * self.panel_surfaces[agent_id] * 0.2
             max_irradiance = 1000 * self.proc_interval_s * self.panel_surfaces[agent_id] * 0.2
-            ax1.plot(irradiance * 2 / max_irradiance, label='Irradiance', color='tab:orange')
+            ax1.plot(irradiance  / max_irradiance, label='Irradiance', color='tab:orange')
             
             ax1.plot(
                 self.battery[agent_id, :].value / (self.battery_capacities_wh[agent_id] * 3600),
@@ -189,5 +196,5 @@ class SB3_MAS_Train:
             plt.grid()
         plt.tight_layout()
         plt.savefig('ilp_solution.png')
-        #plt.show()
+        plt.show()
 

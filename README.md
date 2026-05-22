@@ -25,3 +25,5 @@ Master's Thesis of Lorenzo Pecorari
 #### Data for plots
 
 Each configuration tested has its own directory, it may be needed to change the number of agents, the seed for the day and other customizable parameters. For comparing configurations with already existing data, inside the folder "data_and_plots" there exist a set of scripts allowing to generate most of interesting plots in the study
+
+python -u aggregated_states/sb3_main.py --train-all-mode 1 --num-agents 10 --num-envs 8 --num-episodes 5001

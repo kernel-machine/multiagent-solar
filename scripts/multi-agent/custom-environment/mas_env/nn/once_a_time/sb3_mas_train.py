@@ -19,6 +19,7 @@ import glob
 
 from pathlib import Path
 from datetime import datetime
+from statistics import mean
 
 
 class SB3_MAS_Train:
@@ -133,6 +134,13 @@ class SB3_MAS_Train:
         for i in range(num_agents):
             self.models[i].set_logger(configure(None, ["stdout"]))
             print(f"Agent {i} device: {self.models[i].device}")
+
+        # TensorBoard setup: create a writer for logging training and evaluation rewards
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.tb_log_dir = Path(f"./tensorboard/runs_{timestamp}")
+        os.makedirs(self.tb_log_dir, exist_ok=True)
+        self.tb_writer = SummaryWriter(log_dir=str(self.tb_log_dir))
+        self.episodes_done = 0
 
         self.models_folder = Path("./models/once_a_time")
 
@@ -704,6 +712,12 @@ class SB3_MAS_Train:
 
             self._save_model_for_agent(active_training_node)
             trained_nodes.add(active_training_node)
+            self.tb_writer.add_scalar(f"Reward/Train", mean(rewards_episode.values()), self.episodes_done)
+        # Close TensorBoard writer after training
+        try:
+            self.tb_writer.close()
+        except Exception:
+            pass
         
 
         folder_path = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -744,7 +758,7 @@ class SB3_MAS_Train:
                 batt = int(self.battery_capacities[i])
                 print(f"No saved model found for agent {i} ({batt}Wh), keeping fresh model")
         
-        obs = self.env.reset(self.seed)[0]
+        obs = self.env.reset(self.seed, options={'evaluate': True})[0]
         agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": []} for agent_id in range(self.num_agents)}
         terminate = False
         while not terminate:
@@ -767,7 +781,7 @@ class SB3_MAS_Train:
                 agents_logs[agent_id]["processed_frames"].append(infos[agent_id]["processed_frames"])
                 agents_logs[agent_id]["hs_counter"].append(self.env.hs[agent_id])
                 #agents_logs[agent_id]["processing"].append(obs[agent_id][4])
-                done = terminations[agent_id] or truncations[agent_id]
+                done = terminations[agent_id]# or truncations[agent_id]
                 if done:
                     terminate = True
 

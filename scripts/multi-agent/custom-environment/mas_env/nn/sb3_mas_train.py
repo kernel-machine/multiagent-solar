@@ -4,13 +4,154 @@ import time
 import numpy as np
 import pandas as pd
 import torch as th
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from pathlib import Path
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.callbacks import BaseCallback
-
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from datetime import datetime
 import gymnasium as gym
+
+class DeepSetsExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, max_agents: int = 5, features_dim: int = 128, use_spatial_index: bool = False):
+        super(DeepSetsExtractor, self).__init__(observation_space, features_dim)
+        self.use_spatial_index = use_spatial_index
+        self.max_agents = max_agents
+        self.n_others = max_agents - 1
+        
+        self.own_dim = 3
+        # If use_spatial_index is True, each other agent has 3 features (battery, backlog, index)
+        # Otherwise, 2 features (battery, backlog)
+        self.other_node_dim = 3 if use_spatial_index else 2
+        
+        # Shared MLP for processing each other node
+        self.node_mlp = nn.Sequential(
+            nn.Linear(self.other_node_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+        
+        # MLP to process own state mapping it to the same dimension before concat
+        self.own_mlp = nn.Sequential(
+            nn.Linear(self.own_dim, 64),
+            nn.ReLU()
+        )
+        
+        # We concatenate process(own_state) [64] + max_pool(process(other_nodes)) [64] = 128
+        self._features_dim = 128
+        
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # observations shape: (batch_size, obs_dim)
+        # Split into own, others_flat, mask
+        own_state = observations[:, :self.own_dim]
+        
+        others_flat_end = self.own_dim + self.other_node_dim * self.n_others
+        others_flat = observations[:, self.own_dim:others_flat_end]
+        mask = observations[:, others_flat_end:]
+        
+        batch_size = observations.shape[0]
+        
+        # Reshape others_flat to (batch_size, n_others, other_node_dim)
+        others_reshaped = others_flat.view(batch_size, self.n_others, self.other_node_dim)
+        
+        # Apply shared MLP to each other node
+        # others_reshaped shape: (batch_size, n_others, node_mlp_out_dim)
+        node_embeddings = self.node_mlp(others_reshaped)
+        
+        # Apply mask to node_embeddings before pooling. Mask shape is (batch_size, n_others)
+        # We add a dimension to match node_embeddings: (batch_size, n_others, 1)
+        mask_expanded = mask.unsqueeze(-1)
+        
+        # For max pooling, we want masked items to be very small negatively so they don't affect max
+        masked_embeddings = node_embeddings.masked_fill(mask_expanded == 0, -1e9)
+        
+        # Max pooling over the n_others dimension
+        # global_features shape: (batch_size, 64)
+        global_features, _ = th.max(masked_embeddings, dim=1)
+        
+        # If all nodes were masked out, max_pool will return -1e9, we fix it by making it 0
+        global_features = th.where(global_features == -1e9, th.zeros_like(global_features), global_features)
+        
+        # Process own state
+        own_features = self.own_mlp(own_state)
+        
+        # Concatenate
+        return th.cat([own_features, global_features], dim=1)
+
+
+class LSTMAttentionExtractor(BaseFeaturesExtractor):
+    """
+    Feature extractor that applies learnable attention pooling over the
+    24 LSTM prediction tokens (each with 4 features: value, sin, cos, t_norm)
+    appended at the end of the observation vector.
+
+    The base observation (battery, backlog, timestep, ...) is processed
+    through a small MLP.  The attention-pooled prediction vector (32-dim)
+    is concatenated with it to produce the final feature vector.
+    """
+
+    LSTM_TOKEN_DIM = 4      # (value, sin, cos, t_norm)
+    LSTM_NUM_TOKENS = 24    # 24 prediction steps
+    LSTM_FLAT_DIM = LSTM_TOKEN_DIM * LSTM_NUM_TOKENS  # 96
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Box,
+        features_dim: int = 96,       # 64 (base MLP) + 32 (attention)
+        attn_output_dim: int = 32,
+        attn_hidden_dim: int = 32,
+    ):
+        super(LSTMAttentionExtractor, self).__init__(observation_space, features_dim)
+
+        total_obs_dim = int(np.prod(observation_space.shape))
+        self.base_obs_dim = total_obs_dim - self.LSTM_FLAT_DIM
+
+        # ── Base-state MLP ──────────────────────────────────────────────────
+        base_mlp_out = features_dim - attn_output_dim  # e.g. 64
+        self.base_mlp = nn.Sequential(
+            nn.Linear(self.base_obs_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, base_mlp_out),
+            nn.ReLU(),
+        )
+
+        # ── Attention Pooling over 24 LSTM tokens ──────────────────────────
+        # Project each token to hidden_dim, then use a learnable query vector
+        # to compute attention weights.  The weighted sum is projected to
+        # attn_output_dim (32).
+        self.token_proj = nn.Linear(self.LSTM_TOKEN_DIM, attn_hidden_dim)
+        self.attn_query = nn.Parameter(th.randn(attn_hidden_dim))
+        self.attn_out_proj = nn.Linear(attn_hidden_dim, attn_output_dim)
+
+        self._features_dim = features_dim
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # Split observation into base state and LSTM prediction features
+        base_obs = observations[:, :self.base_obs_dim]
+        lstm_flat = observations[:, self.base_obs_dim:]
+
+        # ── Process base state ──────────────────────────────────────────────
+        base_features = self.base_mlp(base_obs)
+
+        # ── Attention pooling ───────────────────────────────────────────────
+        batch_size = lstm_flat.shape[0]
+        # Reshape flat (batch, 96) → (batch, 24, 4)
+        tokens = lstm_flat.view(batch_size, self.LSTM_NUM_TOKENS, self.LSTM_TOKEN_DIM)
+        # Project tokens: (batch, 24, hidden_dim)
+        projected = th.relu(self.token_proj(tokens))
+        # Attention scores: (batch, 24)
+        scores = th.matmul(projected, self.attn_query)
+        weights = th.softmax(scores, dim=-1)
+        # Weighted sum: (batch, hidden_dim)
+        context = th.sum(projected * weights.unsqueeze(-1), dim=1)
+        # Output projection: (batch, attn_output_dim=32)
+        attn_features = self.attn_out_proj(context)
+
+        return th.cat([base_features, attn_features], dim=1)
+
 import multiprocessing as mp
 import copy
 
@@ -96,7 +237,7 @@ class EnvWrapper(gym.Env):
         raise NotImplementedError("Use the trainer's step logic for multi-agent interaction.")
 
 class SB3_MAS_Train:
-    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5, train_all_mode=1, rotation_episodes=1, total_steps=None, use_cross_attention=False, max_agents=None, attn_d_model=16, ppo_n_steps=512, termination_mode="early"):
+    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5, train_all_mode=1, rotation_episodes=1, total_steps=None, max_agents=None, attn_d_model=16, ppo_n_steps=512, termination_mode="early", use_deepsets=False, use_deepsets_spatial=False, use_cross_attention=False, evaluation_enabled=True, use_lstm_prediction=False, net_arch=None, eval_termination_mode=None):
         self.num_agents = num_agents
         self.num_episodes = num_episodes
         self.max_steps = env.max_steps
@@ -113,9 +254,12 @@ class SB3_MAS_Train:
         self.rotating_env = env
             
         self.save_path = save_path
-        self.use_cross_attention = use_cross_attention
         self.max_agents  = max_agents if max_agents is not None else num_agents
         self.attn_d_model = attn_d_model
+        self.use_deepsets = use_deepsets
+        self.use_deepsets_spatial = use_deepsets_spatial
+        self.use_cross_attention = use_cross_attention
+        self.use_lstm_prediction = use_lstm_prediction
         self.batch_size = batch_size
         self.random_seed = seed
         self.seed = seed
@@ -136,6 +280,7 @@ class SB3_MAS_Train:
         # "early"  → episode ends as soon as any agent's battery hits 0 (old behaviour)
         # "penalty" → episode always runs max_steps; dead agents get per-step penalty
         self.termination_mode = termination_mode
+        self.eval_termination_mode = eval_termination_mode
         
         # Hyperparameters
         self.eps_init = eps_init
@@ -146,6 +291,7 @@ class SB3_MAS_Train:
         # Best reward tracking via deterministic evaluation
         self.best_eval_avg_reward = -np.inf
         self.best_eval_agent_reward = {i: -np.inf for i in range(num_agents)}
+        self.evaluation_enabled = evaluation_enabled
 
         if self.train_all_mode not in (1, 2):
             raise ValueError("train_all_mode must be 1 or 2")
@@ -163,30 +309,35 @@ class SB3_MAS_Train:
         
         device = "cuda" if th.cuda.is_available() else "cpu"
         
+        policy_kwargs = {}
+        if self.use_deepsets or self.use_deepsets_spatial:
+            policy_kwargs = dict(
+                features_extractor_class=DeepSetsExtractor,
+                features_extractor_kwargs=dict(
+                    max_agents=self.max_agents,
+                    features_dim=128,
+                    use_spatial_index=self.use_deepsets_spatial
+                )
+            )
+        elif self.use_lstm_prediction:
+            policy_kwargs = dict(
+                features_extractor_class=LSTMAttentionExtractor,
+                features_extractor_kwargs=dict(
+                    features_dim=96,       # 64 (base MLP) + 32 (attention)
+                    attn_output_dim=32,
+                    attn_hidden_dim=32,
+                )
+            )
+        
+        # Inject net_arch into policy_kwargs (controls hidden layers of pi/vf networks)
+        if net_arch is not None:
+            policy_kwargs.setdefault('net_arch', net_arch)
+        
         if self.algo == "DQN":
-            self.models = {i: DQN("MlpPolicy", EnvWrapper(self.eval_env, i), learning_rate=1e-4, buffer_size=100000, learning_starts=1000, batch_size=batch_size, train_freq=train_freq, target_update_interval=1000, exploration_fraction=0.5, verbose=0, tensorboard_log=None, device=device) for i in range(num_agents)}
+            self.models = {i: DQN("MlpPolicy", EnvWrapper(self.eval_env, i), learning_rate=1e-4, buffer_size=100000, learning_starts=1000, batch_size=batch_size, train_freq=train_freq, target_update_interval=1000, exploration_fraction=0.5, verbose=0, tensorboard_log=None, device=device, policy_kwargs=policy_kwargs if policy_kwargs else None) for i in range(num_agents)}
         else:
             from stable_baselines3.common.vec_env import DummyVecEnv
             lr_schedule = self._linear_lr_schedule(self.ppo_initial_lr, self.ppo_final_lr)
-
-            # Build policy_kwargs: use CrossAttentionExtractor when requested.
-            if self.use_cross_attention:
-                import sys, os as _os
-                # cross_attention_extractor.py lives alongside custom_environment.py
-                # in the aggregated_states/ sub-package directory.
-                _attn_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "aggregated_states")
-                if _attn_dir not in sys.path:
-                    sys.path.insert(0, _attn_dir)
-                from cross_attention_extractor import CrossAttentionExtractor
-                policy_kwargs = dict(
-                    features_extractor_class=CrossAttentionExtractor,
-                    features_extractor_kwargs=dict(
-                        max_agents=self.max_agents,
-                        d_model=self.attn_d_model,
-                    ),
-                )
-            else:
-                policy_kwargs = {}
 
             self.models = {}
             for i in range(num_agents):
@@ -211,6 +362,11 @@ class SB3_MAS_Train:
 
         for i in range(num_agents):
             self.models[i].set_logger(configure(None, ["stdout", "csv"]))
+
+        # TensorBoard writer for training rewards
+        self.log_dir = os.path.join("tb_logs", datetime.now().strftime("%Y%m%d-%H%M%S"))
+        self.tb_writer = \
+             th.utils.tensorboard.SummaryWriter(log_dir=self.log_dir)
 
     def decode(self, action):
         """
@@ -273,8 +429,18 @@ class SB3_MAS_Train:
         self.total_steps_done += step_increment
         return self.total_steps_done >= self.total_steps
 
+    def _episode_done(self, terminations, truncations):
+        if self.termination_mode == "penalty":
+            return all(truncations.values())
+        return any(terminations.values()) or all(truncations.values())
+
+    def _transition_done(self, termination, truncation):
+        if self.termination_mode == "penalty":
+            return truncation
+        return termination or truncation
+
     def _run_evaluation(self):
-        obs, _ = self.eval_env.reset(seed=self.seed)
+        obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': True})
         done = False
         eval_rewards = {i: 0.0 for i in range(self.num_agents)}
         while not done:
@@ -289,7 +455,8 @@ class SB3_MAS_Train:
             for agent_id in range(self.num_agents):
                 eval_rewards[agent_id] += rewards[agent_id]
 
-            if self.termination_mode == "penalty":
+            t_mode = self.eval_termination_mode if self.eval_termination_mode is not None else self.termination_mode
+            if t_mode == "penalty":
                 done = all(truncations.values())
             else:
                 done = any(terminations.values()) or all(truncations.values())
@@ -486,7 +653,7 @@ class SB3_MAS_Train:
                                 last_val = self.models[active_agent].policy.predict_values(last_obs_t)
                             self.models[active_agent].rollout_buffer.compute_returns_and_advantage(
                                 last_val,
-                                np.array([terminations[active_agent] or truncations[active_agent]]),
+                                np.array([self._transition_done(terminations[active_agent], truncations[active_agent])]),
                             )
                             progress = 1.0 - (ep / self.num_episodes)
                             self.models[active_agent]._current_progress_remaining = progress
@@ -497,16 +664,7 @@ class SB3_MAS_Train:
                     stop_training = self._increment_total_steps()
 
                     obs_list = [next_obs]
-                    if self.termination_mode == "penalty":
-                        # Episode ends ONLY at max_steps.
-                        # Dead agents are penalised per-step by the environment.
-                        done = all(truncations.values()) or stop_training
-                    else:
-                        # "early": original behaviour — any death ends the episode.
-                        done = (
-                            any(terminations.values()) or all(truncations.values())
-                            or stop_training
-                        )
+                    done = self._episode_done(terminations, truncations) or stop_training
 
                 step_count += 1
 
@@ -524,10 +682,13 @@ class SB3_MAS_Train:
             for agent_id in range(self.num_agents):
                 rewards_history[agent_id].append(ep_reward[agent_id])
 
+            self.tb_writer.add_scalar("AverageReward/episode", np.mean(list(ep_reward.values())), ep)
+
             # ---- Periodic Deterministic Evaluation (mode=2) ----
             if ep % 20 == 0 or ep == self.num_episodes - 1:
                 eval_rewards = self._run_evaluation()
                 eval_avg_reward = np.mean(list(eval_rewards.values()))
+                self.tb_writer.add_scalar("AverageReward/evaluation", eval_avg_reward, ep)
                 
                 # Update global average
                 if eval_avg_reward > self.best_eval_avg_reward:
@@ -555,6 +716,8 @@ class SB3_MAS_Train:
         self.save_models(episode=self.num_episodes - 1)
 
         self.plot_results(rewards_history, steps_history)
+
+        self.tb_writer.close()
 
         if use_parallel:
             self.env.close()
@@ -632,7 +795,7 @@ class SB3_MAS_Train:
                 
                 for i in range(self.num_agents):
                     if self.num_envs == 1:
-                        is_done = terminations[i] or truncations[i]
+                        is_done = self._transition_done(terminations[i], truncations[i])
                         ep_reward[i] += rewards[i]
                         
                         if self.algo == "DQN":
@@ -664,7 +827,10 @@ class SB3_MAS_Train:
                         
                         self.models[i].num_timesteps += 1
                     else:
-                        is_done_arr = np.array([terminations[env_idx][i] or truncations[env_idx][i] for env_idx in range(self.num_envs)])
+                        is_done_arr = np.array([
+                            self._transition_done(terminations[env_idx][i], truncations[env_idx][i])
+                            for env_idx in range(self.num_envs)
+                        ])
                         rewards_arr = np.array([rewards[env_idx][i] for env_idx in range(self.num_envs)])
                         ep_reward[i] += rewards_arr[0]
                         
@@ -701,17 +867,9 @@ class SB3_MAS_Train:
                     done = True
                 
                 if self.num_envs == 1:
-                    if self.termination_mode == "penalty":
-                        # Episode ends ONLY at max_steps.
-                        done = all(truncations.values())
-                    else:
-                        # "early": original behaviour.
-                        done = any(terminations.values()) or all(truncations.values())
+                    done = self._episode_done(terminations, truncations)
                 else:
-                    if self.termination_mode == "penalty":
-                        done = all(truncations[0].values())
-                    else:
-                        done = any(terminations[0].values()) or all(truncations[0].values())
+                    done = self._episode_done(terminations[0], truncations[0])
 
                 if self.total_steps is not None and stop_training:
                     done = True
@@ -723,10 +881,13 @@ class SB3_MAS_Train:
             for i in range(self.num_agents):
                 rewards_history[i].append(ep_reward[i])
             
+            self.tb_writer.add_scalar("AverageReward/episode", np.mean(list(ep_reward.values())), ep)
+
             # ---- Periodic Deterministic Evaluation (mode=1) ----
-            if ep % 10 == 0 or ep == self.num_episodes - 1:
+            if self.evaluation_enabled and (ep % 10 == 0 or ep == self.num_episodes - 1):
                 eval_rewards = self._run_evaluation()
                 eval_avg_reward = np.mean(list(eval_rewards.values()))
+                self.tb_writer.add_scalar("AverageReward/evaluation", eval_avg_reward, ep)
                 
                 # Save models if this is the best deterministic evaluation reward so far.
                 if eval_avg_reward > self.best_eval_avg_reward:
@@ -741,6 +902,8 @@ class SB3_MAS_Train:
                 else:
                     print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Obs: {[obs[0][i].tolist() for i in range(self.num_agents)]}")
                 
+        self.tb_writer.close()
+
         if self.num_envs > 1:
             self.env.close()
 
@@ -757,7 +920,10 @@ class SB3_MAS_Train:
             fname = os.path.join(self.save_path, f"agent_{i}_best")
             self.models[i].save(fname)
 
-        print(f"Saved Agent: {list(agents_to_save)} | reward: {avg_reward:.4f}] | in: {self.save_path}")
+        if avg_reward is not None:
+            print(f"Saved Agent: {list(agents_to_save)} | reward: {avg_reward:.4f} | in: {self.save_path}")
+        else:
+            print(f"Saved Agent: {list(agents_to_save)} | in: {self.save_path}")
 
     def _load_latest_model_for_agent(self, agent_id):
         model_dir = Path(self.save_path)
@@ -783,8 +949,15 @@ class SB3_MAS_Train:
 
         self.models[agent_id] = model
         return True
+    
+    def save_args(self, args:dict):
+        args_path = os.path.join(self.log_dir, "training_args.txt")
+        with open(args_path, "w") as f:
+            for k, v in args.items():
+                f.write(f"{k}: {v}\n")
+        print(f"Saved training arguments to {args_path}")
 
-    def evaluate(self, model_paths: str = None):
+    def evaluate(self, model_paths: str = None, eval_days: int = 1):
         if model_paths:
             self.save_path = model_paths
 
@@ -794,9 +967,15 @@ class SB3_MAS_Train:
                 batt = int(self.battery_capacities[i])
                 print(f"No saved model found for agent {i} ({batt}Wh), keeping fresh model")
         
-        # Reset eval_env with the configured seed (fixed_winter=355, fixed_summer=172, linear=next)
-        obs, _ = self.eval_env.reset(seed=self.seed)
-        print(f"Evaluating on episode {self.eval_env.episode} (seed='{self.seed}')")
+        # Temporarily override max_steps for multi-day evaluation
+        original_max_steps = self.eval_env.max_steps
+        if eval_days > 1:
+            self.eval_env.max_steps = original_max_steps * eval_days
+            print(f"Multi-day evaluation: {eval_days} days ({self.eval_env.max_steps} steps)")
+
+        # Evaluation should reflect the final safe behavior: stop on battery depletion.
+        obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': True})
+        print(f"Evaluating on episode {self.eval_env.episode} (seed='{self.seed}', days={eval_days})")
         agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": [], "reward": []} for agent_id in range(self.num_agents)}
         terminate = False
         total_rewards = {i: 0 for i in range(self.num_agents)}
@@ -820,47 +999,55 @@ class SB3_MAS_Train:
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
                 agents_logs[agent_id]["state"].append(actions[agent_id][1])
 
-                done = terminations[agent_id] or truncations[agent_id]
-                if done:
-                    terminate = True
+            t_mode = self.eval_termination_mode if self.eval_termination_mode is not None else self.termination_mode
+            if t_mode == "penalty":
+                terminate = all(truncations.values())
+            else:
+                terminate = any(terminations.values()) or all(truncations.values())
 
             obs = next_obs
         
         window_size = 50  # Più è alto, più appiattisce
         
-        # Plot battery levels and processing decisions for all agents
-        plt.figure(figsize=(12, 24))
-        for agent_id in range(self.num_agents):
-            # processing_smoth = pd.Series(agents_logs[agent_id]['processing']).rolling(window=window_size, center=True).mean()
-            #backlog_smoth = agents_logs[agent_id]['backlog'] #pd.Series(agents_logs[agent_id]['backlog']).rolling(window=window_size, center=True).mean()
+        # Build time axis in hours
+        steps_per_day = original_max_steps  # 288 for 5-min intervals
+        num_steps_recorded = len(agents_logs[0]['battery'])
+        hours = np.arange(num_steps_recorded) * (self.proc_interval / 3600.0)
 
+        # Plot battery levels and processing decisions for all agents
+        plt.figure(figsize=(max(12, 4 * eval_days), 4 * self.num_agents))
+        for agent_id in range(self.num_agents):
             plt.subplot(self.num_agents, 1, agent_id + 1)
-            plt.plot(agents_logs[agent_id]['battery'], label='Battery Level')
-            plt.plot(agents_logs[agent_id]['processing'], label='Processing Decision')
-            plt.plot(agents_logs[agent_id]['panel_energy'], label='Panel Energy')
-            plt.plot(agents_logs[agent_id]['backlog'], label='Backlog')
-            plt.plot(agents_logs[agent_id]['state'], label='State')
-            #plt.plot(agents_logs[agent_id]['reward'], label='Reward')
+            plt.plot(hours, agents_logs[agent_id]['battery'], label='Battery Level')
+            plt.plot(hours, agents_logs[agent_id]['processing'], label='Processing Decision')
+            plt.plot(hours, agents_logs[agent_id]['panel_energy'], label='Panel Energy')
+            plt.plot(hours, agents_logs[agent_id]['backlog'], label='Backlog')
+            plt.plot(hours, agents_logs[agent_id]['state'], label='State')
 
             # Color area when battery is 0
             threshold = 0
-            plt.fill_between(range(len(agents_logs[agent_id]['battery'])),
+            plt.fill_between(hours,
                             0,
                             1,
                             where=(np.array(agents_logs[agent_id]['battery']) <= threshold), 
                             color='red', alpha=0.2, label='Battery Depleted')
-            
 
-            plt.title(f'Agent {agent_id} Evaluation')
-            plt.xlabel('Timestep')
+            # Draw vertical day-boundary lines for multi-day evaluation
+            if eval_days > 1:
+                for d in range(1, eval_days):
+                    day_hour = d * 24
+                    plt.axvline(x=day_hour, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+            
+            plt.title(f'Agent {agent_id} Evaluation ({eval_days} day{"s" if eval_days > 1 else ""})')
+            plt.xlabel('Time (hours)')
             plt.ylabel('Value')
-            plt.legend()
-            plt.grid()
+            plt.legend(loc='upper right', fontsize='small')
+            plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        file_name = f"evaluation_{self.num_episodes-1}_{self.eval_env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.train_all_mode}.png"
+        file_name = f"evaluation_{self.num_episodes-1}_{self.eval_env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.train_all_mode}_{eval_days}days.png"
         file_name = os.path.join(self.save_path, file_name)
         print("Saved in ", file_name)
-        plt.savefig(file_name)
+        plt.savefig(file_name, dpi=150)
         plt.close() 
 
         print("Total processed frames during evaluation:", self.eval_env.total_frames_processed)
@@ -879,6 +1066,9 @@ class SB3_MAS_Train:
                     total_solar_joules += irradiance * self.panel_surfaces[agent_id] * 0.2 * self.proc_interval
             print(f"Agent {agent_id}: {total_solar_joules:.2f} Joules ({total_solar_joules/3600:.2f} Wh)")
         print("--------------------------------------")
+
+        # Restore original max_steps
+        self.eval_env.max_steps = original_max_steps
 
 
     def plot_results(self, rewards_history, steps_history):
