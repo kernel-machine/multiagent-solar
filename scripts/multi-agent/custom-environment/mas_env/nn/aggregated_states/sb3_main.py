@@ -2,6 +2,9 @@ import argparse
 import os
 import sys
 
+# Force deterministic PyTorch cuBLAS workspace configuration
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 from custom_environment import CustomEnvironment
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -22,7 +25,7 @@ irradiance_datapaths = [
 
 delta_time = 15 * 60
 proc_interval = 5 * 60
-proc_rate = 20
+proc_rate = 30
 arrival_rate = 15
 
 eps_init = 1.0
@@ -43,9 +46,13 @@ eps_dec = 0.9985
 # battery_capacities = [25, 100, 50, 37]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85]
 
-
+batt_moliplicator_factor = 0.3
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
-panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.52]
+battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
+
+panel_moltiplicator_factor = 0.3
+panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.55]
+panel_surfaces = [p * panel_moltiplicator_factor for p in panel_surfaces]
 
 # num_agents = 10
 # battery_capacities = [
@@ -81,10 +88,9 @@ power_max = 6.0
 w = 1.0
 
 train_freq = 16
-batch_size = 64
+batch_size = 256
 
 mode = 'cuda'
-
 
 
 if __name__ == "__main__":
@@ -110,7 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--gossip-interval", type=int, default=5, help="Number of steps between gossip communications.")
     parser.add_argument("--gossip-targets", type=int, default=2, help="Number of random nodes to send info to during gossip.")
     parser.add_argument("--gossip-state-nodes", type=int, default=3, help="Number of nodes to include in the state from gossip memory.")
-    parser.add_argument("--disable-evaluation", action="store_true", help="Disable evaluation after training.")
+    parser.add_argument("--evaluation-interval", type=int, default=10, help="Interval (episodes) between deterministic evaluations during training. Set to 0 to disable.")
     parser.add_argument("--disable-offloading", action="store_true", help="Temporarily disable offloading mechanism in the environment.")
     parser.add_argument("--lstm-prediction", action="store_true", help="Enable LSTM-based GHI prediction with attention pooling (adds 32-dim forecast feature to agent state).")
     parser.add_argument("--lstm-prediction-demo", action="store_true", help="Like --lstm-prediction but uses real future GHI data instead of LSTM predictions (oracle baseline).")
@@ -118,7 +124,17 @@ if __name__ == "__main__":
     parser.add_argument("--net-layers", type=int, default=2, help="Number of hidden layers in the policy/value networks (default: 2).")
     parser.add_argument("--eval-days", type=int, default=1, help="Number of days to simulate during final evaluation (default: 1).")
     parser.add_argument("--train-days", type=int, default=1, help="Number of days per training episode (default: 1). Higher values teach agents to conserve battery across day boundaries.")
-    parser.add_argument("--seed", type=str, default="random", help="Seed for the random number generator (options: fixed_winter, fixed_summer, linear, random).", choices=["fixed_winter", "fixed_summer", "linear", "random"])
+    parser.add_argument("--seed", type=str, default="random", help="Seed scenario for weather scenario selector (options: fixed_winter, fixed_summer, linear, random).", choices=["fixed_winter", "fixed_summer", "linear", "random"])
+    parser.add_argument("--rng-seed", type=int, default=1234, help="RNG seed for PyTorch, NumPy, and environment PRNG.")
+    parser.add_argument("--handshaking-weight", type=float, default=0.4, help="Handshaking weight reward multiplier (default: 0.4).")
+    parser.add_argument("--offloading-weight", type=float, default=0.5, help="Offloading weight reward multiplier (default: 0.5).")
+    parser.add_argument("--overflow-weight", type=float, default=1, help="Backlog overflow penalty multiplier (default: 0.2).")
+    parser.add_argument("--backlog-loss-weight", type=float, default=1.0, help="Backlog loss weight reward multiplier (default: 1.0).")
+    parser.add_argument("--survival-bonus", type=float, default=0.0, help="Bonus reward per step for staying above the dead threshold (default: 0.0).")
+    parser.add_argument("--processed-images-weight", type=float, default=1.0, help="Processed images weight reward multiplier (default: 1.0).")
+    parser.add_argument("--unprocessed-images-weight", type=float, default=1.0, help="Unprocessed images weight penalty multiplier (default: 1.0).")
+    parser.add_argument("--evaluate", action="store_true", help="Evaluate the trained agent.")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor gamma for RL algorithms (default: 0.995).")
     args = parser.parse_args()
 
     if args.lstm_prediction and args.lstm_prediction_demo:
@@ -153,12 +169,19 @@ if __name__ == "__main__":
         use_lstm_prediction=args.lstm_prediction,
         use_lstm_prediction_demo=args.lstm_prediction_demo,
         disable_offloading=args.disable_offloading,
+        handshaking_weight=args.handshaking_weight,
+        offloading_weight=args.offloading_weight,
+        overflow_weight=args.overflow_weight,
+        backlog_loss_weight=args.backlog_loss_weight,
+        survival_bonus=args.survival_bonus,
+        processed_images_weight=args.processed_images_weight,
+        unprocessed_images_weight=args.unprocessed_images_weight
     )
 
     # Extend training episodes to span multiple days
     if args.train_days > 1:
-        env.max_steps = env.max_steps * args.train_days
-        print(f"Multi-day training: {args.train_days} days/episode ({env.max_steps} steps)")
+        env.max_day_steps = env.max_day_steps * args.train_days
+        print(f"Multi-day training: {args.train_days} days/episode ({env.max_day_steps} steps)")
 
     effective_num_episodes = args.num_episodes
     if args.rotation_cycles is not None:
@@ -197,6 +220,7 @@ if __name__ == "__main__":
         + str(args.train_all_mode)
         + suffix
         + f"/{args.num_agents}agents"
+        + f"lstm_{args.lstm_prediction or args.lstm_prediction_demo}"
     )
 
     trainer1 = SB3_MAS_Train(
@@ -218,7 +242,7 @@ if __name__ == "__main__":
         w,
         mode,
         batch_size,
-        seed=1234,
+        seed=args.rng_seed,
         env=env,
         save_path=save_path,
         num_envs=args.num_envs,
@@ -233,9 +257,11 @@ if __name__ == "__main__":
         use_deepsets=args.deepsets,
         use_deepsets_spatial=args.deepsets_spatial,
         use_cross_attention=args.cross_attention,
-        evaluation_enabled=not args.disable_evaluation,
+        evaluation_interval=args.evaluation_interval,
         use_lstm_prediction=args.lstm_prediction or args.lstm_prediction_demo,
         net_arch=[args.net_width] * args.net_layers,
+        ppo_n_steps=2048,
+        gamma=args.gamma
         )
     
     # trainer2 = SB3_MAS_Train_Parallelized_Threads(
@@ -285,5 +311,6 @@ if __name__ == "__main__":
     # trainer3.train()
     # trainer2.train()
     trainer1.save_args(vars(args))
-    trainer1.train()
+    if not args.evaluate:
+        trainer1.train()
     trainer1.evaluate(model_paths=save_path, eval_days=args.eval_days)

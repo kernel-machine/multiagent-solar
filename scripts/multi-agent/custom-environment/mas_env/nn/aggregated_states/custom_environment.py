@@ -13,8 +13,8 @@ from base_envirionment import BaseEnvironment
 
 class CustomEnvironment(BaseEnvironment):
 
-    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_cross_attention=False, use_deepsets=False, use_deepsets_spatial=False, max_agents=None, random_nodes=0, use_gossip=False, gossip_interval=5, gossip_targets=2, gossip_state_nodes=3, termination_mode="early", battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False):
-        super().__init__(num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip, gossip_interval, gossip_targets, gossip_state_nodes, battery_hard_threshold=battery_hard_threshold, use_random_battery=use_random_battery, use_lstm_prediction=use_lstm_prediction, use_lstm_prediction_demo=use_lstm_prediction_demo, disable_offloading=disable_offloading)
+    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_cross_attention=False, use_deepsets=False, use_deepsets_spatial=False, max_agents=None, random_nodes=0, use_gossip=False, gossip_interval=5, gossip_targets=2, gossip_state_nodes=3, termination_mode="early", battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0):
+        super().__init__(num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip, gossip_interval, gossip_targets, gossip_state_nodes, battery_hard_threshold=battery_hard_threshold, use_random_battery=use_random_battery, use_lstm_prediction=use_lstm_prediction, use_lstm_prediction_demo=use_lstm_prediction_demo, disable_offloading=disable_offloading, handshaking_weight=handshaking_weight, offloading_weight=offloading_weight, overflow_weight=overflow_weight, processed_images_weight=processed_images_weight, unprocessed_images_weight=unprocessed_images_weight, backlog_loss_weight=backlog_loss_weight, survival_bonus=survival_bonus)
         self.termination_mode = termination_mode
 
         self.use_cross_attention = use_cross_attention
@@ -27,64 +27,64 @@ class CustomEnvironment(BaseEnvironment):
         if self.random_nodes > 0:
             assert self.random_nodes < self._num_agents, "random_nodes must be less than the total number of agents"
 
-        # LSTM prediction adds 24×4 = 96 extra observation values
-        self._lstm_obs_dim = 96 if self._lstm_features_enabled else 0
+        # LSTM prediction adds 16×4 = 64 extra observation values
+        self._lstm_obs_dim = 64 if self._lstm_features_enabled else 0
 
         self._action_spaces = {
-            agent: spaces.MultiDiscrete([self._processing_rate + 1, 2, self._num_agents, self._processing_rate + 1]) for agent in self.possible_agents
+            agent: spaces.MultiDiscrete([self._processing_rate + 1, self._num_agents, self._processing_rate + 1]) for agent in self.agents
         }
 
         if self.use_deepsets_spatial:
             n_others = self.max_agents - 1
-            obs_dim  = 4 + 4 * n_others + self._lstm_obs_dim
+            obs_dim  = 5 + 4 * n_others + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
                     high=np.ones(obs_dim, dtype=np.float32) * 2.0,
                     dtype=np.float32
                 )
-                for agent in self.possible_agents
+                for agent in self.agents
             }
         elif self.use_cross_attention or self.use_deepsets:
             # ── Cross-attention / Deep Sets observation space ────────────────
             # [own (4)] + [others_flat  2*(max_agents-1)] + [mask (max_agents-1)]
             # Total: 4 + 3*(max_agents-1)
             n_others = self.max_agents - 1
-            obs_dim  = 4 + 3 * n_others + self._lstm_obs_dim
+            obs_dim  = 5 + 3 * n_others + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
                     high=np.ones(obs_dim, dtype=np.float32) * 2.0,
                     dtype=np.float32
                 )
-                for agent in self.possible_agents
+                for agent in self.agents
             }
         elif self.random_nodes > 0:
             # ── Random nodes observation space ──────────────────────────────────
             # [own (4)] + [random nodes (2 * random_nodes)]
             # Total: 4 + 2 * random_nodes
-            obs_dim = 4 + 2 * self.random_nodes + self._lstm_obs_dim
+            obs_dim = 5 + 2 * self.random_nodes + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
                     high=np.ones(obs_dim, dtype=np.float32) * 2.0,
                     dtype=np.float32
                 )
-                for agent in self.possible_agents
+                for agent in self.agents
             }
         elif self.use_gossip:
             # ── Gossip observation space ─────────────────────────────────────────
             # [own (4)] + [gossip nodes (3 * max_agents)]
             # Values per gossip node: battery, backlog, age
             # Total: 4 + 3 * max_agents
-            obs_dim = 4 + 3 * self.max_agents + self._lstm_obs_dim
+            obs_dim = 5 + 3 * self.max_agents + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
                     high=np.ones(obs_dim, dtype=np.float32) * 2.0,
                     dtype=np.float32
                 )
-                for agent in self.possible_agents
+                for agent in self.agents
             }
 
         else:
@@ -92,14 +92,14 @@ class CustomEnvironment(BaseEnvironment):
             # [battery_i, backlog_i, sin_hour, cos_hour,
             #  min_batt, avg_batt, max_batt,
             #  min_back, avg_back, max_back]  →  10 values
-            obs_dim = 10 + self._lstm_obs_dim
+            obs_dim = 11 + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
                     high=np.ones(obs_dim, dtype=np.float32) * 2.0,
                     dtype=np.float32
                 )
-                for agent in self.possible_agents
+                for agent in self.agents
             }
 
     def gen_obs(self):
@@ -108,11 +108,12 @@ class CustomEnvironment(BaseEnvironment):
             batt_i  = self.battery_energies[agent] / self.battery_capacities[agent]
             back_i  = self.backlogs[agent] / self.max_storage
             # Cyclic hour-of-day encoding (invariant to episode length)
-            seconds_into_day = (self.timestep * self._proc_interval) % (24 * 3600)
+            seconds_into_day = (self.daily_timestamp * self._proc_interval) % (24 * 3600)
             hour = seconds_into_day / 3600.0  # 0.0 – 23.99
             sin_h = np.sin(hour / 23.0)
             cos_h = np.cos(hour / 23.0)
-            own     = [batt_i, back_i, sin_h, cos_h]
+            solar_irradiance = self.get_irradiance_level(self.day, self.daily_timestamp, agent)  # Normalize by panel surface to get a per-unit value
+            own     = [solar_irradiance, batt_i, back_i, sin_h, cos_h]
 
             other_agents = [j for j in range(self._num_agents) if j != agent]
 
@@ -148,7 +149,7 @@ class CustomEnvironment(BaseEnvironment):
             
             elif self.random_nodes > 0:
                 # ── Random nodes format ──────────────────────────────────────
-                sampled_others = np.random.choice(other_agents, self.random_nodes, replace=False)
+                sampled_others = self.np_random.choice(other_agents, self.random_nodes, replace=False)
                 others_flat = []
                 for j in sampled_others:
                     others_flat.append(self.battery_energies[j] / self.battery_capacities[j])
@@ -166,7 +167,7 @@ class CustomEnvironment(BaseEnvironment):
                         gossip_flat.extend([0.0, 0.0, 1.0])
                     elif j in self.gossip_memory[agent]:
                         info = self.gossip_memory[agent][j]
-                        age = (self.timestep - info['timestamp']) / self.max_steps
+                        age = (self.daily_timestamp - info['timestamp']) / self.max_day_steps
                         gossip_flat.extend([info['battery'], info['backlog'], age])
                     else:
                         # Node not in memory (or virtual padding node)

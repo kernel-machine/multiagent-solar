@@ -15,7 +15,7 @@ irradiance_datapaths = [
 
 delta_time = 15 * 60
 proc_interval = 5 * 60
-proc_rate = 20
+proc_rate = 30
 arrival_rate = 15
 
 eps_init = 1.0
@@ -24,9 +24,13 @@ eps_fin = 0.05
 eps_dec = 0.9985
 
 num_agents = 5
+batt_moliplicator_factor = 0.4
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
-panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.52]
+battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
 
+panel_moltiplicator_factor = 0.25
+panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.52]
+panel_surfaces = [p * panel_moltiplicator_factor for p in panel_surfaces]
 
 
 power_idle = 2.6

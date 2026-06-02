@@ -48,10 +48,13 @@ class SB3_MAS_Train:
             # print(filepath, delta_time, proc_interval)
             df = ip.interpolate(filepath, delta_time, proc_interval)
             self.irradiance_data.append(df)
-            self.irradiance_arrays.append(df['ghi'].values[day*24*60//5:(day+1)*24*60//5])
+            values = df['ghi'].values[day*24*60//5:(day+1)*24*60//5]
+            values = list(filter(lambda x: x >= 0, values))
+            self.irradiance_arrays.append(values)
 
+        
         N = self.num_agents
-        T = len(self.irradiance_arrays[0])
+        T = len(min(self.irradiance_arrays, key=len))  # Use the shortest irradiance array length as T
         print("N:", N, "T:", T)
         A = np.full((N, T), self.arrival_rate * self.proc_interval_s)
         x = cp.Variable((N, N, T), nonneg=True, integer=True)

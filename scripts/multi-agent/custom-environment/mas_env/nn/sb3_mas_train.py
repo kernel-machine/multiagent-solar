@@ -1,6 +1,8 @@
 import os
 import hashlib
 import time
+import shutil
+import signal
 import numpy as np
 import pandas as pd
 import torch as th
@@ -94,8 +96,8 @@ class LSTMAttentionExtractor(BaseFeaturesExtractor):
     """
 
     LSTM_TOKEN_DIM = 4      # (value, sin, cos, t_norm)
-    LSTM_NUM_TOKENS = 24    # 24 prediction steps
-    LSTM_FLAT_DIM = LSTM_TOKEN_DIM * LSTM_NUM_TOKENS  # 96
+    LSTM_NUM_TOKENS = 16    # 16 prediction steps
+    LSTM_FLAT_DIM = LSTM_TOKEN_DIM * LSTM_NUM_TOKENS  # 64
 
     def __init__(
         self,
@@ -164,7 +166,8 @@ def _worker(remote, parent_remote, env):
                 obs, reward, term, trunc, info = env.step(data)
                 remote.send((obs, reward, term, trunc, info))
             elif cmd == 'reset':
-                obs, info = env.reset(seed=data)
+                seed, options = data
+                obs, info = env.reset(seed=seed, options=options)
                 remote.send((obs, info))
             elif cmd == 'close':
                 remote.close()
@@ -183,18 +186,18 @@ class AsyncMultiAgentEnvs:
             process.start()
             self.processes.append(process)
             work_remote.close()
-        self.max_steps = env.max_steps
-        self.episode = env.episode
+        self.max_steps = env.max_day_steps
+        self.day = env.day
         self.total_frames_processed = env.total_frames_processed
         self.irradiance_arrays = env.irradiance_arrays
         
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
         for idx, remote in enumerate(self.remotes):
             if isinstance(seed, (int, np.integer)):
                 remote_seed = int(seed) + idx
             else:
                 remote_seed = seed
-            remote.send(('reset', remote_seed))
+            remote.send(('reset', (remote_seed, options)))
         results = [remote.recv() for remote in self.remotes]
         obs_batch, infos_batch = zip(*results)
         return list(obs_batch), list(infos_batch)
@@ -237,10 +240,10 @@ class EnvWrapper(gym.Env):
         raise NotImplementedError("Use the trainer's step logic for multi-agent interaction.")
 
 class SB3_MAS_Train:
-    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5, train_all_mode=1, rotation_episodes=1, total_steps=None, max_agents=None, attn_d_model=16, ppo_n_steps=512, termination_mode="early", use_deepsets=False, use_deepsets_spatial=False, use_cross_attention=False, evaluation_enabled=True, use_lstm_prediction=False, net_arch=None, eval_termination_mode=None):
+    def __init__(self, num_agents, num_episodes, irradiance_datapaths, delta_time, proc_interval, proc_rate, arrival_rate, eps_init, eps_fin, eps_dec, battery_capacities, panel_surfaces, power_idle, power_max, train_freq, w, mode, batch_size, seed, env, save_path, num_envs=4, algo="PPO", ppo_initial_lr=3e-4, ppo_final_lr=3e-5, train_all_mode=1, rotation_episodes=1, total_steps=None, max_agents=None, attn_d_model=16, ppo_n_steps=512, termination_mode="early", use_deepsets=False, use_deepsets_spatial=False, use_cross_attention=False, evaluation_interval=10, use_lstm_prediction=False, net_arch=None, eval_termination_mode=None, gamma=0.995):
         self.num_agents = num_agents
         self.num_episodes = num_episodes
-        self.max_steps = env.max_steps
+        self.max_steps = env.max_day_steps
         self.eval_env = env
         self.algo = algo.upper()
         # For mode=2 with PPO we allow parallel envs; DQN always uses 1.
@@ -291,7 +294,12 @@ class SB3_MAS_Train:
         # Best reward tracking via deterministic evaluation
         self.best_eval_avg_reward = -np.inf
         self.best_eval_agent_reward = {i: -np.inf for i in range(num_agents)}
-        self.evaluation_enabled = evaluation_enabled
+        # evaluation_interval controls how often (every N episodes) deterministic
+        # evaluations run during training. If set to 0, evaluations are disabled.
+        self.evaluation_interval = int(evaluation_interval)
+        self.evaluation_enabled = (self.evaluation_interval != 0)
+        # Discount factor for RL algorithms
+        self.gamma = float(gamma)
 
         if self.train_all_mode not in (1, 2):
             raise ValueError("train_all_mode must be 1 or 2")
@@ -304,10 +312,12 @@ class SB3_MAS_Train:
         th.manual_seed(self.rng_seed)
         if th.cuda.is_available():
             th.cuda.manual_seed_all(self.rng_seed)
+            th.backends.cudnn.deterministic = True
+            th.backends.cudnn.benchmark = False
         
         os.makedirs(self.save_path, exist_ok=True)
         
-        device = "cuda" if th.cuda.is_available() else "cpu"
+        device = mode if (mode == "cpu" or not th.cuda.is_available()) else "cuda"
         
         policy_kwargs = {}
         if self.use_deepsets or self.use_deepsets_spatial:
@@ -324,8 +334,8 @@ class SB3_MAS_Train:
                 features_extractor_class=LSTMAttentionExtractor,
                 features_extractor_kwargs=dict(
                     features_dim=96,       # 64 (base MLP) + 32 (attention)
-                    attn_output_dim=32,
-                    attn_hidden_dim=32,
+                    attn_output_dim=64,
+                    attn_hidden_dim=64,
                 )
             )
         
@@ -334,7 +344,7 @@ class SB3_MAS_Train:
             policy_kwargs.setdefault('net_arch', net_arch)
         
         if self.algo == "DQN":
-            self.models = {i: DQN("MlpPolicy", EnvWrapper(self.eval_env, i), learning_rate=1e-4, buffer_size=100000, learning_starts=1000, batch_size=batch_size, train_freq=train_freq, target_update_interval=1000, exploration_fraction=0.5, verbose=0, tensorboard_log=None, device=device, policy_kwargs=policy_kwargs if policy_kwargs else None) for i in range(num_agents)}
+            self.models = {i: DQN("MlpPolicy", EnvWrapper(self.eval_env, i), learning_rate=1e-4, buffer_size=100000, learning_starts=1000, batch_size=batch_size, train_freq=train_freq, target_update_interval=1000, exploration_fraction=0.5, verbose=0, tensorboard_log=None, device=device, seed=self.rng_seed, policy_kwargs=policy_kwargs if policy_kwargs else None, gamma=self.gamma) for i in range(num_agents)}
         else:
             from stable_baselines3.common.vec_env import DummyVecEnv
             lr_schedule = self._linear_lr_schedule(self.ppo_initial_lr, self.ppo_final_lr)
@@ -357,7 +367,9 @@ class SB3_MAS_Train:
                     n_epochs=10,
                     verbose=0,
                     device=device,
+                    seed=self.rng_seed,
                     policy_kwargs=policy_kwargs if policy_kwargs else None,
+                    gamma=self.gamma,
                 )
 
         for i in range(num_agents):
@@ -367,6 +379,23 @@ class SB3_MAS_Train:
         self.log_dir = os.path.join("tb_logs", datetime.now().strftime("%Y%m%d-%H%M%S"))
         self.tb_writer = \
              th.utils.tensorboard.SummaryWriter(log_dir=self.log_dir)
+        self._tensorboard_logs_completed = False
+
+        signal.signal(signal.SIGINT, self._handle_sigint)
+
+    def _close_tensorboard_writer(self):
+        tb_writer = getattr(self, "tb_writer", None)
+        if tb_writer is not None:
+            tb_writer.close()
+            self.tb_writer = None
+
+    def _handle_sigint(self, signum, frame):
+        if not getattr(self, "_tensorboard_logs_completed", False):
+            print("Training interrupted by Ctrl+C. Removing TensorBoard logs...")
+            self._close_tensorboard_writer()
+            if getattr(self, "log_dir", None):
+                shutil.rmtree(self.log_dir, ignore_errors=True)
+        raise KeyboardInterrupt
 
     def decode(self, action):
         """
@@ -377,19 +406,7 @@ class SB3_MAS_Train:
         """
         action = np.array(action).flatten()
 
-        if len(action) == 4:
-            # MultiDiscrete: [fti, oti, target, off_rate] — use directly
-            return [float(action[0]), int(action[1]), int(action[2]), float(action[3])]
-
-        # Legacy flat-integer encoding (DQN)
-        a = int(action[0])
-        fti = a % 21
-        rem = a // 21
-        oti = rem % 3
-        rem = rem // 3
-        target = rem % self.num_agents
-        off_rate = rem // self.num_agents
-        return [float(fti), int(oti), int(target), float(off_rate)]
+        return [float(action[0]), int(action[1]),float(action[2])]
 
     @staticmethod
     def _linear_lr_schedule(initial_lr, final_lr):
@@ -485,7 +502,8 @@ class SB3_MAS_Train:
             if stop_training:
                 break
 
-            obs_list, _ = env_handle.reset(seed=self.seed)
+            reset_seed = self.rng_seed if ep == 0 else None
+            obs_list, _ = env_handle.reset(seed=reset_seed)
             # Normalise: single-env reset returns a dict; multi-env returns a list of dicts.
             # We work with obs_list always being a list of length n.
             if not use_parallel:
@@ -717,7 +735,8 @@ class SB3_MAS_Train:
 
         self.plot_results(rewards_history, steps_history)
 
-        self.tb_writer.close()
+        self._tensorboard_logs_completed = True
+        self._close_tensorboard_writer()
 
         if use_parallel:
             self.env.close()
@@ -736,9 +755,16 @@ class SB3_MAS_Train:
             if self.total_steps is not None and self.total_steps_done >= self.total_steps:
                 break
 
-            obs, info = self.env.reset(seed=self.seed)
+            reset_seed = self.rng_seed if ep == 0 else None
+            obs, info = self.env.reset(seed=reset_seed, options={'reset_fields': True})
             done = False
             ep_reward = {i: 0 for i in range(self.num_agents)}
+            ep_processing_rewards = {i: 0 for i in range(self.num_agents)}
+            ep_offloading_rewards = {i: 0 for i in range(self.num_agents)}
+            ep_overflow_rewards = {i: 0 for i in range(self.num_agents)}
+            ep_battery_rewards = {i: 0 for i in range(self.num_agents)}
+            ep_threshold_rewards = {i: 0 for i in range(self.num_agents)}
+
             step_count = 0
             
             while not done:
@@ -797,6 +823,11 @@ class SB3_MAS_Train:
                     if self.num_envs == 1:
                         is_done = self._transition_done(terminations[i], truncations[i])
                         ep_reward[i] += rewards[i]
+                        ep_processing_rewards[i] += infos[i]["processing_reward"]
+                        ep_offloading_rewards[i] += infos[i]["offloading_reward"]
+                        ep_overflow_rewards[i] += infos[i]["overflow_reward"]
+                        ep_battery_rewards[i] += infos[i]["battery_reward"]
+                        ep_threshold_rewards[i] += infos[i]["threshold_reward"]
                         
                         if self.algo == "DQN":
                             self.models[i].replay_buffer.add(obs[i], next_obs[i], np.array([actions_encoded[i]]), rewards[i], is_done, [{}])
@@ -832,7 +863,12 @@ class SB3_MAS_Train:
                             for env_idx in range(self.num_envs)
                         ])
                         rewards_arr = np.array([rewards[env_idx][i] for env_idx in range(self.num_envs)])
-                        ep_reward[i] += rewards_arr[0]
+                        ep_reward[i] += rewards_arr.mean()
+                        ep_processing_rewards[i] += np.array([infos[env_idx][i]["processing_reward"] for env_idx in range(self.num_envs)]).mean()
+                        ep_offloading_rewards[i] += np.array([infos[env_idx][i]["offloading_reward"] for env_idx in range(self.num_envs)]).mean()
+                        ep_overflow_rewards[i] += np.array([infos[env_idx][i]["overflow_reward"] for env_idx in range(self.num_envs)]).mean()
+                        ep_battery_rewards[i] += np.array([infos[env_idx][i]["battery_reward"] for env_idx in range(self.num_envs)]).mean()
+                        ep_threshold_rewards[i] += np.array([infos[env_idx][i]["threshold_reward"] for env_idx in range(self.num_envs)]).mean()
                         
                         action_shape = actions_encoded[i].reshape(self.num_envs, 1) if len(actions_encoded[i].shape) == 1 else actions_encoded[i]
                         
@@ -862,6 +898,9 @@ class SB3_MAS_Train:
                 
                 obs = next_obs
                 step_count += 1
+                
+                if step_count % 50 == 0:
+                    print(f"Episode {ep} - Step {step_count} (buffer size: {self.models[0].rollout_buffer.pos})")
 
                 if self.total_steps is not None and stop_training:
                     done = True
@@ -882,9 +921,16 @@ class SB3_MAS_Train:
                 rewards_history[i].append(ep_reward[i])
             
             self.tb_writer.add_scalar("AverageReward/episode", np.mean(list(ep_reward.values())), ep)
+            # Log per-step averages for clarity (rewards are summed across steps)
+            steps = max(1, step_count)
+            self.tb_writer.add_scalar("AverageReward/processing", np.mean(list(ep_processing_rewards.values())) / steps, ep)
+            self.tb_writer.add_scalar("AverageReward/offloading", np.mean(list(ep_offloading_rewards.values())) / steps, ep)
+            self.tb_writer.add_scalar("AverageReward/overflow", np.mean(list(ep_overflow_rewards.values())) / steps, ep)
+            self.tb_writer.add_scalar("AverageReward/battery", np.mean(list(ep_battery_rewards.values())) / steps, ep)
+            self.tb_writer.add_scalar("AverageReward/threshold", np.mean(list(ep_threshold_rewards.values())) / steps, ep)
 
             # ---- Periodic Deterministic Evaluation (mode=1) ----
-            if self.evaluation_enabled and (ep % 10 == 0 or ep == self.num_episodes - 1):
+            if self.evaluation_enabled and (ep % self.evaluation_interval == 0 or ep == self.num_episodes - 1):
                 eval_rewards = self._run_evaluation()
                 eval_avg_reward = np.mean(list(eval_rewards.values()))
                 self.tb_writer.add_scalar("AverageReward/evaluation", eval_avg_reward, ep)
@@ -902,7 +948,9 @@ class SB3_MAS_Train:
                 else:
                     print(f"Ep {ep}/{self.num_episodes} - Steps: {step_count} - Obs: {[obs[0][i].tolist() for i in range(self.num_agents)]}")
                 
-        self.tb_writer.close()
+        self._tensorboard_logs_completed = True
+        self._close_tensorboard_writer()
+        self.save_models()
 
         if self.num_envs > 1:
             self.env.close()
@@ -958,6 +1006,7 @@ class SB3_MAS_Train:
         print(f"Saved training arguments to {args_path}")
 
     def evaluate(self, model_paths: str = None, eval_days: int = 1):
+        use_eval_reset = True
         if model_paths:
             self.save_path = model_paths
 
@@ -966,53 +1015,54 @@ class SB3_MAS_Train:
             if not loaded:
                 batt = int(self.battery_capacities[i])
                 print(f"No saved model found for agent {i} ({batt}Wh), keeping fresh model")
-        
-        # Temporarily override max_steps for multi-day evaluation
-        original_max_steps = self.eval_env.max_steps
-        if eval_days > 1:
-            self.eval_env.max_steps = original_max_steps * eval_days
-            print(f"Multi-day evaluation: {eval_days} days ({self.eval_env.max_steps} steps)")
+                return
 
         # Evaluation should reflect the final safe behavior: stop on battery depletion.
-        obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': True})
-        print(f"Evaluating on episode {self.eval_env.episode} (seed='{self.seed}', days={eval_days})")
+        obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': use_eval_reset, "reset_fields": True})
+        print(f"Evaluating on episode {self.eval_env.day} (seed='{self.seed}', days={eval_days})")
         agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": [], "reward": []} for agent_id in range(self.num_agents)}
-        terminate = False
         total_rewards = {i: 0 for i in range(self.num_agents)}
-        while not terminate:
+        episode_ends = []
+        step = 0
+        days = 7
+        while days > 0:
             actions = {}
             for agent_id in range(self.num_agents):
                 agent_obs = obs[agent_id]
                 action, _ = self.models[agent_id].predict(agent_obs, deterministic=True)
                 actions[agent_id] = self.decode(action)
 
+            # print("ACTIONS: ", actions)
+
             next_obs, rewards, terminations, truncations, infos = self.eval_env.step(actions)
+            step += 1
             for agent_id in range(self.num_agents):
 
                 total_rewards[agent_id] += rewards[agent_id]
 
-                print(f"Agent {agent_id} - State: {obs[agent_id][2]})")
-                agents_logs[agent_id]["battery"].append(obs[agent_id][0])
-                agents_logs[agent_id]["panel_energy"].append(infos[agent_id]["panel_energy"])
-                agents_logs[agent_id]["processing"].append(actions[agent_id][0]/20)
-                agents_logs[agent_id]["backlog"].append(obs[agent_id][1])
+                # print(f"Agent {agent_id} - State: {obs[agent_id][2]})")
+                agents_logs[agent_id]["battery"].append(obs[agent_id][1])
+                agents_logs[agent_id]["panel_energy"].append(obs[agent_id][0])
+                agents_logs[agent_id]["processing"].append(actions[agent_id][0]/self.proc_rate)
+                agents_logs[agent_id]["backlog"].append(obs[agent_id][2])
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
-                agents_logs[agent_id]["state"].append(actions[agent_id][1])
 
-            t_mode = self.eval_termination_mode if self.eval_termination_mode is not None else self.termination_mode
-            if t_mode == "penalty":
-                terminate = all(truncations.values())
-            else:
-                terminate = any(terminations.values()) or all(truncations.values())
+            for agent_id in range(self.num_agents):
+                if infos[agent_id].get("is_day_changed", False):
+                    episode_ends.append(step)
+                    days -= 1
+                    print(f"--- Day {self.eval_env.day} ended at step {step} ---")
+                    break
+            terminate = any(terminations.values())
+            if terminate:
+                break
 
             obs = next_obs
-        
-        window_size = 50  # Più è alto, più appiattisce
-        
+                
         # Build time axis in hours
-        steps_per_day = original_max_steps  # 288 for 5-min intervals
         num_steps_recorded = len(agents_logs[0]['battery'])
         hours = np.arange(num_steps_recorded) * (self.proc_interval / 3600.0)
+        episode_ends = np.array(episode_ends) * (self.proc_interval / 3600.0)
 
         # Plot battery levels and processing decisions for all agents
         plt.figure(figsize=(max(12, 4 * eval_days), 4 * self.num_agents))
@@ -1022,7 +1072,7 @@ class SB3_MAS_Train:
             plt.plot(hours, agents_logs[agent_id]['processing'], label='Processing Decision')
             plt.plot(hours, agents_logs[agent_id]['panel_energy'], label='Panel Energy')
             plt.plot(hours, agents_logs[agent_id]['backlog'], label='Backlog')
-            plt.plot(hours, agents_logs[agent_id]['state'], label='State')
+            plt.vlines(episode_ends, ymin=0, ymax=1, color='green', linestyle='--', linewidth=0.8, alpha=0.9)
 
             # Color area when battery is 0
             threshold = 0
@@ -1031,21 +1081,15 @@ class SB3_MAS_Train:
                             1,
                             where=(np.array(agents_logs[agent_id]['battery']) <= threshold), 
                             color='red', alpha=0.2, label='Battery Depleted')
-
-            # Draw vertical day-boundary lines for multi-day evaluation
-            if eval_days > 1:
-                for d in range(1, eval_days):
-                    day_hour = d * 24
-                    plt.axvline(x=day_hour, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
-            
+       
             plt.title(f'Agent {agent_id} Evaluation ({eval_days} day{"s" if eval_days > 1 else ""})')
             plt.xlabel('Time (hours)')
             plt.ylabel('Value')
-            plt.legend(loc='upper right', fontsize='small')
+            plt.legend(loc='upper left', fontsize='small')
             plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        file_name = f"evaluation_{self.num_episodes-1}_{self.eval_env.episode}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.train_all_mode}_{eval_days}days.png"
-        file_name = os.path.join(self.save_path, file_name)
+        file_name = f"evaluation_{self.num_episodes-1}_{self.eval_env.day}_{self.proc_interval}_{self.w}_{self.num_agents}agents_{self.train_all_mode}_{eval_days}days.png"
+        file_name = os.path.join(self.log_dir, file_name)
         print("Saved in ", file_name)
         plt.savefig(file_name, dpi=150)
         plt.close() 
@@ -1055,8 +1099,8 @@ class SB3_MAS_Train:
         print("Total transferred frames during evaluation:", self.eval_env.total_transferred_frames)
         
         print("\n--- Total Solar Energy Accumulated ---")
-        episode = self.eval_env.episode
-        max_steps = int(self.eval_env.max_steps)
+        episode = self.eval_env.day
+        max_steps = int(self.eval_env.max_day_steps)
         for agent_id in range(self.num_agents):
             total_solar_joules = 0.0
             for t in range(max_steps):
@@ -1066,9 +1110,6 @@ class SB3_MAS_Train:
                     total_solar_joules += irradiance * self.panel_surfaces[agent_id] * 0.2 * self.proc_interval
             print(f"Agent {agent_id}: {total_solar_joules:.2f} Joules ({total_solar_joules/3600:.2f} Wh)")
         print("--------------------------------------")
-
-        # Restore original max_steps
-        self.eval_env.max_steps = original_max_steps
 
 
     def plot_results(self, rewards_history, steps_history):
