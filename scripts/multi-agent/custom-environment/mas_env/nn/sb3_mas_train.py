@@ -1047,12 +1047,6 @@ class SB3_MAS_Train:
                 agents_logs[agent_id]["backlog"].append(obs[agent_id][2])
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
 
-            for agent_id in range(self.num_agents):
-                if infos[agent_id].get("is_day_changed", False):
-                    episode_ends.append(step)
-                    days -= 1
-                    print(f"--- Day {self.eval_env.day} ended at step {step} ---")
-                    break
             terminate = any(terminations.values())
             if terminate:
                 break

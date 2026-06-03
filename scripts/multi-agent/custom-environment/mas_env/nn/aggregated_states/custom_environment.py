@@ -34,9 +34,10 @@ class CustomEnvironment(BaseEnvironment):
             agent: spaces.MultiDiscrete([self._processing_rate + 1, self._num_agents, self._processing_rate + 1]) for agent in self.agents
         }
 
+        base_obs_dim = 7
         if self.use_deepsets_spatial:
             n_others = self.max_agents - 1
-            obs_dim  = 5 + 4 * n_others + self._lstm_obs_dim
+            obs_dim  = base_obs_dim + 4 * n_others + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
@@ -50,7 +51,7 @@ class CustomEnvironment(BaseEnvironment):
             # [own (4)] + [others_flat  2*(max_agents-1)] + [mask (max_agents-1)]
             # Total: 4 + 3*(max_agents-1)
             n_others = self.max_agents - 1
-            obs_dim  = 5 + 3 * n_others + self._lstm_obs_dim
+            obs_dim  = base_obs_dim + 3 * n_others + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
@@ -63,7 +64,7 @@ class CustomEnvironment(BaseEnvironment):
             # ── Random nodes observation space ──────────────────────────────────
             # [own (4)] + [random nodes (2 * random_nodes)]
             # Total: 4 + 2 * random_nodes
-            obs_dim = 5 + 2 * self.random_nodes + self._lstm_obs_dim
+            obs_dim = base_obs_dim + 2 * self.random_nodes + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
@@ -77,7 +78,7 @@ class CustomEnvironment(BaseEnvironment):
             # [own (4)] + [gossip nodes (3 * max_agents)]
             # Values per gossip node: battery, backlog, age
             # Total: 4 + 3 * max_agents
-            obs_dim = 5 + 3 * self.max_agents + self._lstm_obs_dim
+            obs_dim = base_obs_dim + 3 * self.max_agents + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
@@ -92,7 +93,7 @@ class CustomEnvironment(BaseEnvironment):
             # [battery_i, backlog_i, sin_hour, cos_hour,
             #  min_batt, avg_batt, max_batt,
             #  min_back, avg_back, max_back]  →  10 values
-            obs_dim = 11 + self._lstm_obs_dim
+            obs_dim = base_obs_dim + 7 + self._lstm_obs_dim
             self._observation_spaces = {
                 agent: spaces.Box(
                     low=np.zeros(obs_dim, dtype=np.float32),
@@ -106,14 +107,16 @@ class CustomEnvironment(BaseEnvironment):
         observations = {}
         for agent in range(self._num_agents):
             batt_i  = self.battery_energies[agent] / self.battery_capacities[agent]
-            back_i  = self.backlogs[agent] / self.max_storage
+            back_i1  = self.backlogs[agent][0] / self.max_storage
+            back_i2  = self.backlogs[agent][1] / self.max_storage
+            back_i3  = self.backlogs[agent][2] / self.max_storage
             # Cyclic hour-of-day encoding (invariant to episode length)
             seconds_into_day = (self.daily_timestamp * self._proc_interval) % (24 * 3600)
             hour = seconds_into_day / 3600.0  # 0.0 – 23.99
             sin_h = np.sin(hour / 23.0)
             cos_h = np.cos(hour / 23.0)
             solar_irradiance = self.get_irradiance_level(self.day, self.daily_timestamp, agent)  # Normalize by panel surface to get a per-unit value
-            own     = [solar_irradiance, batt_i, back_i, sin_h, cos_h]
+            own     = [solar_irradiance, batt_i, back_i1, back_i2, back_i3, sin_h, cos_h]
 
             other_agents = [j for j in range(self._num_agents) if j != agent]
 
@@ -125,7 +128,7 @@ class CustomEnvironment(BaseEnvironment):
 
                 for slot, j in enumerate(other_agents):
                     others_flat[3 * slot]     = self.battery_energies[j] / self.battery_capacities[j]
-                    others_flat[3 * slot + 1] = self.backlogs[j] / self.max_storage
+                    others_flat[3 * slot + 1] = sum(self.backlogs[j]) / self.max_storage
                     others_flat[3 * slot + 2] = j / max(1, self.max_agents - 1)  # Normalized index
                     mask[slot]                = 1.0
                 
@@ -141,7 +144,7 @@ class CustomEnvironment(BaseEnvironment):
 
                 for slot, j in enumerate(other_agents):
                     others_flat[2 * slot]     = self.battery_energies[j] / self.battery_capacities[j]
-                    others_flat[2 * slot + 1] = self.backlogs[j] / self.max_storage
+                    others_flat[2 * slot + 1] = sum(self.backlogs[j]) / self.max_storage
                     mask[slot]                = 1.0
                 # Remaining slots stay 0.0 (padding, mask=0)
 
@@ -153,7 +156,7 @@ class CustomEnvironment(BaseEnvironment):
                 others_flat = []
                 for j in sampled_others:
                     others_flat.append(self.battery_energies[j] / self.battery_capacities[j])
-                    others_flat.append(self.backlogs[j] / self.max_storage)
+                    others_flat.append(sum(self.backlogs[j]) / self.max_storage)
                 
                 obs = own + others_flat
 
@@ -179,7 +182,7 @@ class CustomEnvironment(BaseEnvironment):
             else:
                 # ── Aggregated stats (original) ──────────────────────────────
                 batts = [self.battery_energies[j] / self.battery_capacities[j] for j in other_agents]
-                backs = [self.backlogs[j] / self.max_storage                    for j in other_agents]
+                backs = [sum(self.backlogs[j]) / self.max_storage                    for j in other_agents]
 
                 obs = own + [
                     min(batts), sum(batts) / len(batts), max(batts),
