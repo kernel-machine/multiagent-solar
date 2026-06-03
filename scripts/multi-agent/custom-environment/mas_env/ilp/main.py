@@ -23,7 +23,7 @@ eps_fin = 0.05
 # eps_dec = 0.999
 eps_dec = 0.9985
 
-num_agents = 5
+num_agents = 3
 batt_moliplicator_factor = 0.4
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
 battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
@@ -43,7 +43,8 @@ battery_capacities = battery_capacities[:num_agents]
 panel_surfaces = panel_surfaces[:num_agents]
 
 if __name__ == '__main__':
-    s = SB3_MAS_Train(num_agents,
+    s = SB3_MAS_Train(
+        num_agents,
           irradiance_datapaths,
           delta_time,
           proc_interval,
@@ -56,6 +57,9 @@ if __name__ == '__main__':
           panel_surfaces,
           power_idle,
           power_max,
-          w)
+          w,
+          initial_backlog = 100,
+          initial_energy = 0.5
+          )
     s.solve()
     s.print_solution()

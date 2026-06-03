@@ -19,7 +19,10 @@ class SB3_MAS_Train:
             panel_surfaces: list,
             power_idle: float,
             power_max: float,
-            w: float):
+            w: float,
+            processing_days: int = 1,
+            initial_backlog: int = 0,
+            initial_energy: float = 0.5):
     
         self.num_agents = num_agents
         self.irradiance_datapaths = irradiance_datapaths
@@ -43,25 +46,25 @@ class SB3_MAS_Train:
         self.irradiance_data = []
         self.irradiance_arrays = []
         # Battery starts at 50% of its capacity
-        day = 0
+        day = processing_days
         for filepath in self.irradiance_datapaths:
             # print(filepath, delta_time, proc_interval)
             df = ip.interpolate(filepath, delta_time, proc_interval)
             self.irradiance_data.append(df)
             values = df['ghi'].values[day*24*60//5:(day+1)*24*60//5]
-            values = list(filter(lambda x: x >= 0, values))
+            values = list(filter(lambda x: x > 0, values))
             self.irradiance_arrays.append(values)
 
-        
         N = self.num_agents
-        T = len(min(self.irradiance_arrays, key=len))  # Use the shortest irradiance array length as T
-        print("N:", N, "T:", T)
+        T = len(self.irradiance_arrays[0])
+
         A = np.full((N, T), self.arrival_rate * self.proc_interval_s)
         x = cp.Variable((N, N, T), nonneg=True, integer=True)
         B = cp.Variable((N, T+1), nonneg=True)
         E = cp.Variable((N, T+1))
         spill = cp.Variable((N, T), nonneg=True)       
-        #slack = cp.Variable((N, T+1), nonneg=True)
+        # SLACK REMOVED — forces strict E >= 0 like RL environment
+        # slack = cp.Variable((N, T), nonneg=True)
         y = cp.Variable((N, N, T), boolean=True) # Unicast transmission indicator
         
         self.Eharv = np.array(self.irradiance_arrays) # (N, T)
@@ -70,15 +73,15 @@ class SB3_MAS_Train:
         constraints = []
 
         # Backlog starts at 0
-        B0 = np.zeros(N)
+        B0 = np.full(N, self.arrival_rate * self.proc_interval_s * 20)
         constraints += [B[:, 0] == B0]
 
         # Keep energy units consistent in Joules across the model.
-        E0_vec = np.array(self.battery_capacities_wh) * 0.5 * 3600
+        E0_vec = np.array(self.battery_capacities_wh) * initial_energy * 3600
         constraints += [E[:, 0] == E0_vec]
 
         # Hard physical limit (battery energy cannot be negative)
-        constraints += [E <= np.array(self.battery_capacities_wh).reshape(-1, 1)*3600]
+        constraints += [E <= np.array(self.battery_capacities_wh).reshape(-1, 1) * 3600]
 
         # Soft safety threshold constraint (15% capacity, matching the 0.15 threshold in the RL environment)
         battery_threshold_ratio = 0.001
