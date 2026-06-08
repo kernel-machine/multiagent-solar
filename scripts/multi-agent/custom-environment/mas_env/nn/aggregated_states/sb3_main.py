@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from itertools import cycle, islice
 
 # Force deterministic PyTorch cuBLAS workspace configuration
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -114,8 +115,10 @@ if __name__ == "__main__":
     parser.add_argument("--random-nodes", type=int, default=0, help="Insert the battery and backlog values of X randomly selected nodes into the state.")
     parser.add_argument("--gossip", action="store_true", help="Enable gossip mechanism for information sharing.")
     parser.add_argument("--gossip-interval", type=int, default=5, help="Number of steps between gossip communications.")
-    parser.add_argument("--gossip-targets", type=int, default=2, help="Number of random nodes to send info to during gossip.")
+    parser.add_argument("--gossip-peers", type=int, default=2, help="Number of fixed peers each node selects at start for gossip.")
     parser.add_argument("--gossip-state-nodes", type=int, default=3, help="Number of nodes to include in the state from gossip memory.")
+    parser.add_argument("--gossip-order", type=str, choices=["priority", "timestamp"], default=None, help="Criterio di ordinamento della gossip memory (priority=utility, timestamp=most recent first)")
+    parser.add_argument("--backlog-buckets", type=int, default=3, help="Number of backlog buckets stored per agent (use 1 for a single backlog value).")
     parser.add_argument("--evaluation-interval", type=int, default=10, help="Interval (episodes) between deterministic evaluations during training. Set to 0 to disable.")
     parser.add_argument("--disable-offloading", action="store_true", help="Temporarily disable offloading mechanism in the environment.")
     parser.add_argument("--lstm-prediction", action="store_true", help="Enable LSTM-based GHI prediction with attention pooling (adds 32-dim forecast feature to agent state).")
@@ -142,6 +145,15 @@ if __name__ == "__main__":
 
     effective_max_agents = args.max_agents if args.max_agents is not None else args.num_agents
 
+    def expand_to_num_agents(values, target_count):
+        if len(values) >= target_count:
+            return list(values[:target_count])
+        return list(islice(cycle(values), target_count))
+
+    irradiance_datapaths = expand_to_num_agents(irradiance_datapaths, args.num_agents)
+    battery_capacities = expand_to_num_agents(battery_capacities, args.num_agents)
+    panel_surfaces = expand_to_num_agents(panel_surfaces, args.num_agents)
+
     env = CustomEnvironment(
         args.num_agents,
         irradiance_datapaths,
@@ -162,8 +174,10 @@ if __name__ == "__main__":
         random_nodes=args.random_nodes,
         use_gossip=args.gossip,
         gossip_interval=args.gossip_interval,
-        gossip_targets=args.gossip_targets,
+        gossip_peers=args.gossip_peers,
         gossip_state_nodes=args.gossip_state_nodes,
+        gossip_order=args.gossip_order,
+        #backlog_buckets=args.backlog_buckets,
         battery_hard_threshold=args.battery_hard_threshold,
         use_random_battery=True,
         use_lstm_prediction=args.lstm_prediction,
@@ -203,10 +217,13 @@ if __name__ == "__main__":
     elif args.deepsets:
         suffix = "_deepsets"
     elif args.gossip:
-        suffix = f"_gossip_{args.gossip_interval}_{args.gossip_targets}_{args.gossip_state_nodes}"
+        suffix = f"_gossip_{args.gossip_interval}_{args.gossip_peers}_{args.gossip_state_nodes}"
     elif args.random_nodes > 0:
         suffix = f"_random_nodes_{args.random_nodes}"
     
+    if args.backlog_buckets != 3:
+        suffix += f"_backlog_buckets_{args.backlog_buckets}"
+
     if args.lstm_prediction:
         suffix += "_lstm_prediction"
     elif args.lstm_prediction_demo:

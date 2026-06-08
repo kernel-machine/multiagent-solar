@@ -22,7 +22,8 @@ class SB3_MAS_Train:
             w: float,
             processing_days: int = 1,
             initial_backlog: int = 0,
-            initial_energy: float = 0.5):
+            initial_energy: float = 0.5,
+            days_to_process: int = 1):
     
         self.num_agents = num_agents
         self.irradiance_datapaths = irradiance_datapaths
@@ -51,7 +52,7 @@ class SB3_MAS_Train:
             # print(filepath, delta_time, proc_interval)
             df = ip.interpolate(filepath, delta_time, proc_interval)
             self.irradiance_data.append(df)
-            values = df['ghi'].values[day*24*60//5:(day+1)*24*60//5]
+            values = df['ghi'].values[day*24*60//5:(day+days_to_process)*24*60//5]
             values = list(filter(lambda x: x > 0, values))
             self.irradiance_arrays.append(values)
 
@@ -138,7 +139,7 @@ class SB3_MAS_Train:
         SPILL_PENALTY = 1e-3
         EPSILON_OBJ = 1e-6
 
-        SLACK_PENALTY = 100.0  # Strongly penalize dropping below 15% safety threshold
+        #SLACK_PENALTY = 100.0  # Strongly penalize dropping below 15% safety threshold
 
         objective = cp.Maximize(
             processed_total

@@ -29,5 +29,5 @@ Each configuration tested has its own directory, it may be needed to change the 
 Best training parameters with offloading disabled
 
 ```bash
-python -u aggregated_states/sb3_main.py --num-envs 10 --num-agents 10 --termination-mode early --eval-termination-mode early --battery-hard-threshold 0.2 --seed random --num-episodes 1000 --net-width 256 --net-layers 3 --handshaking-weight 0 --disable-offloading --evaluation-interval 0 --gamma 0.995
+python -u aggregated_states/sb3_main.py --num-envs 10 --num-agents 10 --termination-mode early --eval-termination-mode early --battery-hard-threshold 0.2 --seed random --num-episodes 1000 --net-width 256 --net-layers 3 --handshaking-weight 0 --evaluation-interval 0 --gamma 0.995 --gossip --offloading-weight 0.5 --gossip-peers 5 --gossip-state-nodes 3 --processed-images-weight 1 --overflow-weight 1 --gossip-order timestamp
 ```

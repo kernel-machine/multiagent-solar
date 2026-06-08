@@ -1020,7 +1020,7 @@ class SB3_MAS_Train:
         # Evaluation should reflect the final safe behavior: stop on battery depletion.
         obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': use_eval_reset, "reset_fields": True})
         print(f"Evaluating on episode {self.eval_env.day} (seed='{self.seed}', days={eval_days})")
-        agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloading": [], "reward": []} for agent_id in range(self.num_agents)}
+        agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloaded_images": [], "received_images": [], "reward": []} for agent_id in range(self.num_agents)}
         total_rewards = {i: 0 for i in range(self.num_agents)}
         episode_ends = []
         step = 0
@@ -1046,7 +1046,15 @@ class SB3_MAS_Train:
                 agents_logs[agent_id]["processing"].append(actions[agent_id][0]/self.proc_rate)
                 agents_logs[agent_id]["backlog"].append(obs[agent_id][2])
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
+                agents_logs[agent_id]["offloaded_images"].append(infos[agent_id]["offloaded_images"])
+                agents_logs[agent_id]["received_images"].append(infos[agent_id]["received_images"])
 
+            for agent_id in range(self.num_agents):
+                if infos[agent_id].get("is_day_changed", False):
+                    episode_ends.append(step)
+                    days -= 1
+                    print(f"--- Day {self.eval_env.day} ended at step {step} ---")
+                    break
             terminate = any(terminations.values())
             if terminate:
                 break
@@ -1067,6 +1075,8 @@ class SB3_MAS_Train:
             plt.plot(hours, agents_logs[agent_id]['panel_energy'], label='Panel Energy')
             plt.plot(hours, agents_logs[agent_id]['backlog'], label='Backlog')
             plt.vlines(episode_ends, ymin=0, ymax=1, color='green', linestyle='--', linewidth=0.8, alpha=0.9)
+            plt.plot(hours, agents_logs[agent_id]['offloaded_images'], label='Offloaded Images')
+            plt.plot(hours, agents_logs[agent_id]['received_images'], label='Received Images')
 
             # Color area when battery is 0
             threshold = 0

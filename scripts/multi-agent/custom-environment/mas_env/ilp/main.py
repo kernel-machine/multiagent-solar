@@ -24,12 +24,12 @@ eps_fin = 0.05
 eps_dec = 0.9985
 
 num_agents = 3
-batt_moliplicator_factor = 0.4
+batt_moliplicator_factor = 0.3
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
 battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
 
-panel_moltiplicator_factor = 0.25
-panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.52]
+panel_moltiplicator_factor = 0.3
+panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.55]
 panel_surfaces = [p * panel_moltiplicator_factor for p in panel_surfaces]
 
 
@@ -59,7 +59,9 @@ if __name__ == '__main__':
           power_max,
           w,
           initial_backlog = 100,
-          initial_energy = 0.5
+          initial_energy = 0.5,
+          processing_days = 1,
+          days_to_process = 7
           )
     s.solve()
     s.print_solution()

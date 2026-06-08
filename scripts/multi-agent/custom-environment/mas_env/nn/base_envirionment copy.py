@@ -1,3 +1,4 @@
+from torch._higher_order_ops import while_loop
 from collections import abc
 from operator import is_
 from pandas import options
@@ -18,13 +19,14 @@ import sys
 from prediction_module.prediction import GHIPredictorLSTM
 
 MAX_EPISODE_STEPS = 288
+ETX_EXP_COEFF = 1.5
 
 class BaseEnvironment(ParallelEnv):
     metadata = {
         "name": "custom_environment_v0",
     }
 
-    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip=False, gossip_interval=5, gossip_peers=2, gossip_state_nodes=3, battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0):
+    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip=False, gossip_interval=5, gossip_targets=2, gossip_state_nodes=3, battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0, backlog_buckets=3):
         super().__init__()
         
         self.disable_offloading = disable_offloading
@@ -35,11 +37,11 @@ class BaseEnvironment(ParallelEnv):
         self.backlog_loss_weight = backlog_loss_weight
         self.survival_bonus = survival_bonus
         self.unprocessed_images_weight = unprocessed_images_weight
+        self.backlog_buckets = max(1, int(backlog_buckets))
         
         self.use_gossip = use_gossip
         self.gossip_interval = gossip_interval
-        # Number of fixed peers each node selects at reset for gossip sending
-        self.gossip_peers = gossip_peers
+        self.gossip_targets = gossip_targets
         self.gossip_state_nodes = gossip_state_nodes
         self.battery_hard_threshold = battery_hard_threshold
         self.use_random_battery = use_random_battery
@@ -100,7 +102,8 @@ class BaseEnvironment(ParallelEnv):
         self.e_frame = (0.8 * (power_max - power_idle) * 1) / proc_rate
         self.e_tx_rx = (0.2 * (power_max - power_idle) * 1) / proc_rate
         
-        self.backlogs = [0 for i in range(0, self._num_agents)]        
+        
+        self.backlogs = [[0 for _ in range(self.backlog_buckets)] for i in range(0, self._num_agents)]        
         # internal counters for episode compeltion 
         self.daily_timestamp = 0
         self.day = 0
@@ -149,6 +152,13 @@ class BaseEnvironment(ParallelEnv):
         seed_text = str(seed).encode("utf-8")
         return int.from_bytes(hashlib.sha256(seed_text).digest()[:4], byteorder="little", signed=False)
 
+    def _empty_backlog(self):
+        return [0 for _ in range(self.backlog_buckets)]
+
+    def _random_backlog(self):
+        upper_bound = max(1, self.max_storage // self.backlog_buckets)
+        return [random.randint(0, upper_bound) for _ in range(self.backlog_buckets)]
+
         
 
     def step(self, actions):
@@ -157,7 +167,7 @@ class BaseEnvironment(ParallelEnv):
         for agent_id in range(0, self._num_agents):
             if self.battery_energies[agent_id] > 0:
                 frames_arrived = self._arrival_rate * self._proc_interval
-                self.backlogs[agent_id] += frames_arrived
+                self.backlogs[agent_id][0] += frames_arrived
 
         is_day_changed = False
         processing_reward = {}
@@ -187,6 +197,7 @@ class BaseEnvironment(ParallelEnv):
         #_dead_penalty = self._arrival_rate * self._proc_interval  # unnormalized, same scale as rewards
         offloaded_images_dict = {i: 0 for i in range(0, self._num_agents)}
         received_images_dict = {i: 0 for i in range(0, self._num_agents)}
+        
         for agent_id in range(0, self._num_agents):
             
             hard_threshold_energy = self.battery_capacities[agent_id] * self.battery_hard_threshold
@@ -210,26 +221,31 @@ class BaseEnvironment(ParallelEnv):
             #processable = max(min(backlog, int((actual_battery - self.e_idle) / self.e_frame), self._processing_rate * self._proc_interval), 0)
             processed_images = fti * self._proc_interval
             max_processed_images = self._processing_rate * self._proc_interval
-            processed_images = min(processed_images, self.backlogs[agent_id])
+            processed_images = min(processed_images, sum(self.backlogs[agent_id]))
             needed_energy = (processed_images * self.e_frame) + self.e_idle
 
-            backlog_loss_weight = self.backlog_loss_weight
+            #backlog_loss_weight = self.backlog_loss_weight
             local_processing = 0
-            battery_capacity = self.battery_capacities[agent_id]
+            #battery_capacity = self.battery_capacities[agent_id]
             if actual_battery > needed_energy:
                 self.total_frames_processed += processed_images
-                self.backlogs[agent_id] = max(self.backlogs[agent_id] - processed_images, 0)
+                images_to_remove = min(processed_images, sum(self.backlogs[agent_id]))
+                while images_to_remove > 0:
+                    for idx in range(self.backlog_buckets-1, -1, -1):
+                        while self.backlogs[agent_id][idx] > 0 and images_to_remove > 0:
+                            self.backlogs[agent_id][idx] -= 1
+                            images_to_remove -= 1
+   
+                #self.backlogs[agent_id] = max(self.backlogs[agent_id] - processed_images, 0)
                 local_processing = processed_images / self._proc_interval
-                unprocessed_images = max_processed_images - processed_images
                 processing_reward[agent_id] = processed_images 
                 #battery_reward[agent_id] = self.survival_bonus * max(actual_battery - needed_energy, 0) / (battery_capacity + 1e-6)
             else:
-                processing_reward[agent_id] = -processed_images - self.backlogs[agent_id]
+                processing_reward[agent_id] = -processed_images - sum(self.backlogs[agent_id])
                 
             #battery_reward[agent_id] = -self.survival_bonus * max(needed_energy - actual_battery, 0) / (battery_capacity + 1e-6)
 
-            processing_reward[agent_id] /= (self._processing_rate)
-            processing_reward[agent_id] *= self.processed_images_weight
+            processing_reward[agent_id] /= (self._processing_rate * self._proc_interval) 
             actual_battery = max(actual_battery - needed_energy, 0)
 
             self.battery_energies[agent_id] = min(actual_battery, self.battery_capacities[agent_id])
@@ -245,58 +261,59 @@ class BaseEnvironment(ParallelEnv):
             elif self.use_gossip and len(self.gossip_memory[agent_id]) < self.gossip_state_nodes:
                 can_offload = False
             
-            # Under gossip mode, allow offloading only to nodes that have sent gossip info to this agent
-            if can_offload and self.use_gossip:
-                allowed_senders = list(self.gossip_memory[agent_id].keys())
-                if target not in allowed_senders:
-                    can_offload = False
-
             if can_offload and off_rate > 0 and target != agent_id:
-                offloaded_images = min(off_rate * self._proc_interval, self.backlogs[agent_id], self.max_storage - self.backlogs[target])
+                offloaded_images = min(off_rate * self._proc_interval, sum(self.backlogs[agent_id]), self.max_storage - sum(self.backlogs[target]))
                 offloaded_images = max(offloaded_images, 0)
                 offloaded_images_dict[agent_id] = offloaded_images
-                received_images_dict[target] += offloaded_images
-                needed_energy = offloaded_images * self.e_tx_rx # * self._proc_interval
-                self.tx_energy_consumed += needed_energy
+
+                # Compute energy needed for offloading
+                images_to_remove = offloaded_images
+                needed_energy = 0
+                while images_to_remove > 0:
+                    for idx in range(self.backlog_buckets):
+                        while self.backlogs[agent_id][idx] > 0 and images_to_remove > 0:
+                            needed_energy += self.e_tx_rx*(ETX_EXP_COEFF**idx)
+                            images_to_remove -= 1
+                
+                #needed_energy = offloaded_images * self.e_tx_rx # * self._proc_interval
                 offload_step_reward = 0
                 if self.battery_energies[agent_id] > needed_energy:
-                    self.backlogs[agent_id] = max(self.backlogs[agent_id] - offloaded_images, 0)
-                    self.backlogs[target] += offloaded_images
+                    self.tx_energy_consumed += needed_energy
+                    #images_to_remove = offloaded_images
+                    #while images_to_remove > 0:
+                    for idx in range(self.backlog_buckets):
+                        while sum(self.backlogs[target]) < self.max_storage and images_to_remove > 0:
+                            self.backlogs[agent_id][idx] -= 1
+                            self.backlogs[target][min(idx+1, self.backlog_buckets-1)] += 1
+                            images_to_remove -= 1
+                    #self.backlogs[agent_id] = max(self.backlogs[agent_id] - offloaded_images, 0)
+                    #self.backlogs[target] += offloaded_images
+                    received_images_dict[target] += offloaded_images
                     offload_step_reward = offloaded_images
                 else: # Not enough energy to transmit
                     offload_step_reward = -offloaded_images
                 self.battery_energies[agent_id] = max(self.battery_energies[agent_id] - needed_energy, 0)
 
                 # self.offload_weight < processing_weight to prioritize local processing over offloading, and vice versa
-                offloading_reward[agent_id] += self.offloading_weight * offload_step_reward / (self._processing_rate)
-        
-                offloading_reward[agent_id] -= (self.offloading_weight/2)*self.tx_energy_consumed / (self.e_tx_rx * self._processing_rate * self._num_agents)
-        
+                offloading_reward[agent_id] += self.offloading_weight * offload_step_reward / (self._processing_rate * self._proc_interval)
+                if self.backlog_buckets == 1:
+                    offloading_reward[agent_id] -= (self.offloading_weight/2) * self.tx_energy_consumed / (self.e_tx_rx * self._processing_rate * self._proc_interval * self._num_agents)
         #Penalize buffer overflow
         for agent_id in range(0, self._num_agents):
-            buffer_fill = self.backlogs[agent_id] / (self.max_storage + 1e-6)
-            overflow_reward[agent_id] = ((self.overflow_weight**buffer_fill) - 1)/(self._processing_rate)
-            if self.backlogs[agent_id] > self.max_storage:
-                #backlog_difference = self.backlogs[agent_id] - self.max_storage
-                #overflow_reward[agent_id] = (-backlog_difference*self.overflow_weight)/(self._processing_rate * self._proc_interval)
-                self.backlogs[agent_id] = self.max_storage
+            if sum(self.backlogs[agent_id]) > self.max_storage:
+                backlog_difference = sum(self.backlogs[agent_id]) - self.max_storage
+                overflow_reward[agent_id] = -backlog_difference/(self._processing_rate * self._proc_interval)
 
-            # battery_capacity = self.battery_capacities[agent_id]
-            # battery_ratio = self.battery_energies[agent_id] / (battery_capacity + 1e-6)
-            # threshold_scale = self.survival_bonus if self.survival_bonus != 0 else 1.0
-            # threshold_center = self.battery_hard_threshold if self.battery_hard_threshold > 0 else 0.5
-            # threshold_temperature = 0.15 if self.battery_hard_threshold > 0 else 0.25
+                # drop packets
+                images_to_drop = sum(self.backlogs[agent_id]) - self.max_storage
+                while images_to_drop > 0:
+                    for idx in range(self.backlog_buckets):
+                        if self.backlogs[agent_id][idx] > 0:
+                            self.backlogs[agent_id][idx] -= 1
+                            images_to_drop -= 1
+                        if images_to_drop == 0:
+                            break
 
-            # threshold_reward[agent_id] = threshold_scale * np.tanh(
-            #     (battery_ratio - threshold_center) / max(1e-6, threshold_temperature)
-            # )
-            # battery_reward[agent_id] = threshold_reward[agent_id]
-
-            #overflow_reward[agent_id] = 0.2* (-self.backlogs[agent_id] / self.max_storage)
-            #processing_reward[agent_id] = 0.5*actions[agent_id][0] 
-
-        # Normalize rewards
-        #rewards = {a: rewards[a] / (self._processing_rate * self._proc_interval) for a in self.agents}
         terminations = {}
         truncations = {}
         for a in self.agents:
@@ -307,24 +324,14 @@ class BaseEnvironment(ParallelEnv):
         self.daily_timestamp += 1
         self.episode_steps += 1
         
-        # Gossip communication: send only to the persistent peers selected at reset
+        # Gossip communication
         if self.use_gossip and (self.daily_timestamp % self.gossip_interval == 0):
             for agent_id in self.agents:
-                # send to the persistent peers selected at reset (no random fallback)
-                if getattr(self, 'peers', None) is None:
-                    # if peers not initialized, select up to gossip_peers now
-                    k = min(self.gossip_peers, self._num_agents - 1)
-                    other_agents = [j for j in self.agents if j != agent_id]
-                    if k <= 0:
-                        targets = []
-                    else:
-                        targets = list(self.np_random.choice(other_agents, k, replace=False))
-                else:
-                    targets = list(self.peers[agent_id])
-
+                other_agents = [j for j in self.agents if j != agent_id]
+                targets = self.np_random.choice(other_agents, min(self.gossip_targets, len(other_agents)), replace=False)
                 info = {
                     'battery': self.battery_energies[agent_id] / self.battery_capacities[agent_id],
-                    'backlog': self.backlogs[agent_id] / self.max_storage,
+                    'backlog': sum(self.backlogs[agent_id]) / self.max_storage,
                     'timestamp': self.daily_timestamp
                 }
                 for target_agent in targets:
@@ -373,27 +380,16 @@ class BaseEnvironment(ParallelEnv):
         if reset_fields: 
             if is_evaluation:
                 self.battery_energies = [(self.battery_capacities[i] * 0.5) for i in range(0, self._num_agents)]
-                self.backlogs = [0 for i in range(0, self._num_agents)]
+                self.backlogs = [self._empty_backlog() for i in range(0, self._num_agents)]
                 self.day = 0
                 self.total_frames_processed = 0
                 self.total_transferred_frames = 0
             else:
                 self.battery_energies = [(self.battery_capacities[i] * self.np_random.uniform(0.1,0.5)) for i in range(0, self._num_agents)]
-                self.backlogs = [random.randint(0, self.max_storage) for i in range(0, self._num_agents)]
+                self.backlogs = [self._random_backlog() for i in range(0, self._num_agents)]
         
 
         self.gossip_memory = {a: {} for a in self.agents}
-
-        # Persistent peer selection: each node selects a fixed set of peers
-        # Number of peers defaults to self.gossip_peers (set from constructor)
-        k = min(self.gossip_peers, self._num_agents - 1)
-        self.peers = {}
-        for a in self.agents:
-            others = [j for j in self.agents if j != a]
-            if k <= 0:
-                self.peers[a] = []
-            else:
-                self.peers[a] = list(self.np_random.choice(others, k, replace=False))
 
         self.fs = [0 for i in range(0, self._num_agents)]
         self.hs = [0 for i in range(0, self._num_agents)]
