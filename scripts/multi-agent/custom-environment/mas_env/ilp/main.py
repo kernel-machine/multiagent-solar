@@ -1,3 +1,4 @@
+import argparse
 from ilp_solver import SB3_MAS_Train
 
 irradiance_datapaths = [
@@ -16,25 +17,25 @@ irradiance_datapaths = [
 delta_time = 15 * 60
 proc_interval = 5 * 60
 proc_rate = 30
-arrival_rate = 15
+arrival_rate = 20
 
 eps_init = 1.0
 eps_fin = 0.05
 # eps_dec = 0.999
 eps_dec = 0.9985
 
-num_agents = 3
-batt_moliplicator_factor = 0.3
+num_agents = 5
+batt_moliplicator_factor = 0.5
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
 battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
 
-panel_moltiplicator_factor = 0.3
-panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.55]
+panel_moltiplicator_factor = 0.5
+panel_surfaces = [0.45, 0.4, 0.50, 0.35, 0.4, 0.275, 0.35, 0.3, 0.5, 0.275]
 panel_surfaces = [p * panel_moltiplicator_factor for p in panel_surfaces]
 
 
-power_idle = 2.6
-power_max = 6.0
+power_idle = 2.8
+power_max = 8
 
 w = 1.0
 
@@ -43,6 +44,12 @@ battery_capacities = battery_capacities[:num_agents]
 panel_surfaces = panel_surfaces[:num_agents]
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='ILP solver for MAS scheduling')
+    parser.add_argument('--variable-arrival-rate', action='store_true',
+                        help='Use sinusoidal variable arrival rate (2h period, per-agent phase shift)')
+    parser.add_argument("--days", type=int, default=1)
+    args = parser.parse_args()
+
     s = SB3_MAS_Train(
         num_agents,
           irradiance_datapaths,
@@ -61,7 +68,8 @@ if __name__ == '__main__':
           initial_backlog = 100,
           initial_energy = 0.5,
           processing_days = 1,
-          days_to_process = 7
+          days_to_process = args.days,
+          variable_arrival_rate = args.variable_arrival_rate
           )
     s.solve()
     s.print_solution()

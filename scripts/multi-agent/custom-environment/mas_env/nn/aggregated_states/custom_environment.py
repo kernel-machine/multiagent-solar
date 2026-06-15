@@ -13,8 +13,8 @@ from base_envirionment import BaseEnvironment
 
 class CustomEnvironment(BaseEnvironment):
 
-    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_cross_attention=False, use_deepsets=False, use_deepsets_spatial=False, max_agents=None, random_nodes=0, use_gossip=False, gossip_interval=5, gossip_peers=None, gossip_state_nodes=3, gossip_order=None, termination_mode="early", battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0):
-        super().__init__(num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip, gossip_interval, gossip_peers=gossip_peers, gossip_state_nodes=gossip_state_nodes, battery_hard_threshold=battery_hard_threshold, use_random_battery=use_random_battery, use_lstm_prediction=use_lstm_prediction, use_lstm_prediction_demo=use_lstm_prediction_demo, disable_offloading=disable_offloading, handshaking_weight=handshaking_weight, offloading_weight=offloading_weight, overflow_weight=overflow_weight, processed_images_weight=processed_images_weight, unprocessed_images_weight=unprocessed_images_weight, backlog_loss_weight=backlog_loss_weight, survival_bonus=survival_bonus)
+    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_cross_attention=False, use_deepsets=False, use_deepsets_spatial=False, max_agents=None, random_nodes=0, use_gossip=False, gossip_interval=5, gossip_peers=None, gossip_state_nodes=3, gossip_order=None, termination_mode="early", battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0, variable_arrival_rate=False, battery_reward_weight=1.0, max_buffer_steps=10):
+        super().__init__(num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip, gossip_interval, gossip_peers=gossip_peers, gossip_state_nodes=gossip_state_nodes, battery_hard_threshold=battery_hard_threshold, use_random_battery=use_random_battery, use_lstm_prediction=use_lstm_prediction, use_lstm_prediction_demo=use_lstm_prediction_demo, disable_offloading=disable_offloading, handshaking_weight=handshaking_weight, offloading_weight=offloading_weight, overflow_weight=overflow_weight, processed_images_weight=processed_images_weight, unprocessed_images_weight=unprocessed_images_weight, backlog_loss_weight=backlog_loss_weight, survival_bonus=survival_bonus, variable_arrival_rate=variable_arrival_rate, battery_reward_weight=battery_reward_weight, max_buffer_steps=max_buffer_steps)
         self.termination_mode = termination_mode
         self.gossip_order = gossip_order
 
@@ -36,7 +36,9 @@ class CustomEnvironment(BaseEnvironment):
         }
 
         # Base own observation size: solar irradiance, battery, backlog buckets..., sin_h, cos_h
-        own_obs_dim = 5
+        # When variable_arrival_rate is enabled, we add 1 extra dimension for
+        # the normalized frames_arrived value.
+        own_obs_dim = 5 + (1 if self.variable_arrival_rate else 0)
         if self.use_deepsets_spatial:
             n_others = self.max_agents - 1
             obs_dim  = own_obs_dim + 4 * n_others + self._lstm_obs_dim
@@ -117,6 +119,8 @@ class CustomEnvironment(BaseEnvironment):
             cos_h = np.cos(hour / 23.0)
             solar_irradiance = self.get_irradiance_level(self.day, self.daily_timestamp, agent)  # Normalize by panel surface to get a per-unit value
             own     = [solar_irradiance, batt_i, backlog, sin_h, cos_h]
+            if self.variable_arrival_rate:
+                own.append(self.get_frames_arrived_norm(agent))
 
             other_agents = [j for j in range(self._num_agents) if j != agent]
 

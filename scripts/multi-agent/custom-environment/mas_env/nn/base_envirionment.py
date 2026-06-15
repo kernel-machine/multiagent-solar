@@ -4,6 +4,7 @@ from pandas import options
 from abc import abstractmethod
 import functools
 import os
+from math import log, ceil
 
 from pettingzoo import ParallelEnv
 from gymnasium import spaces
@@ -24,7 +25,7 @@ class BaseEnvironment(ParallelEnv):
         "name": "custom_environment_v0",
     }
 
-    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip=False, gossip_interval=5, gossip_peers=2, gossip_state_nodes=3, battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0):
+    def __init__(self, num_agents, irradiance_datapaths, delta_time, proc_interval, proc_rate, arr_rate, batteries, panel_surfaces, power_idle, power_max, w, seed, use_gossip=False, gossip_interval=5, gossip_peers=2, gossip_state_nodes=3, battery_hard_threshold=0.0, use_random_battery=False, use_lstm_prediction=False, use_lstm_prediction_demo=False, disable_offloading=False, handshaking_weight=0.4, offloading_weight=0.5, overflow_weight=0.2, processed_images_weight=1.0, unprocessed_images_weight=1.0, backlog_loss_weight=1.0, survival_bonus=0.0, variable_arrival_rate=False, battery_reward_weight=1.0, max_buffer_steps=10):
         super().__init__()
         
         self.disable_offloading = disable_offloading
@@ -34,6 +35,7 @@ class BaseEnvironment(ParallelEnv):
         self.processed_images_weight = processed_images_weight
         self.backlog_loss_weight = backlog_loss_weight
         self.survival_bonus = survival_bonus
+        self.battery_reward_weight = battery_reward_weight
         self.unprocessed_images_weight = unprocessed_images_weight
         
         self.use_gossip = use_gossip
@@ -47,6 +49,9 @@ class BaseEnvironment(ParallelEnv):
         self.use_lstm_prediction_demo = use_lstm_prediction_demo
         # Convenience flag: either mode needs raw data + temporal features
         self._lstm_features_enabled = use_lstm_prediction or use_lstm_prediction_demo
+        self.variable_arrival_rate = variable_arrival_rate
+        # Period of 2 hours expressed in timesteps
+        self._arrival_period_steps = int(2 * 3600 / proc_interval)
         
         self.agents = [i for i in range(0, num_agents)]
         
@@ -60,8 +65,8 @@ class BaseEnvironment(ParallelEnv):
         self.is_evaluation = False
         
         self.max_irrad = 1000.0
-        self.panel_efficiency = 0.2
-        self.max_storage = self._arrival_rate * self._proc_interval * 30
+        self.panel_efficiency = 0.12
+        self.max_storage = self._arrival_rate * self._proc_interval * max_buffer_steps
         
         self.irradiance_data = []
         self.irradiance_arrays = []
@@ -82,12 +87,12 @@ class BaseEnvironment(ParallelEnv):
             
             self.irradiance_data.append(df)
             
-            self.irradiance_arrays.append(df['ghi'].values)
+            self.irradiance_arrays.append(df['gti'].values)
             
             # Load raw CSV at original 15-min resolution for LSTM / demo input
             if self._lstm_features_enabled:
                 raw_df = pd.read_csv(filepath)
-                raw_ghi = raw_df['ghi'].values.astype(np.float32)
+                raw_ghi = raw_df['gti'].values.astype(np.float32)
                 self.irradiance_raw_arrays.append(raw_ghi)
         
         self.irradiance_level = [0.0 for i in range(0, self._num_agents)]
@@ -110,6 +115,7 @@ class BaseEnvironment(ParallelEnv):
         self.total_frames_processed = 0
         self.total_transferred_frames = 0
         self.tx_energy_consumed = 0.0
+        self.offloaded_images_counter = [[0 for i in range(0, self._num_agents)] for j in range(0, self._num_agents)]
         
         # ── LSTM Prediction Module ────────────────────────────────────────────
         if self._lstm_features_enabled:
@@ -154,10 +160,14 @@ class BaseEnvironment(ParallelEnv):
     def step(self, actions):
 
         # updating backlogs with arriving frames for each agent
+        frames_arrived_list = []
         for agent_id in range(0, self._num_agents):
             if self.battery_energies[agent_id] > 0:
-                frames_arrived = self._arrival_rate * self._proc_interval
+                frames_arrived = self.get_frames_arrived(agent_id)
                 self.backlogs[agent_id] += frames_arrived
+                frames_arrived_list.append(frames_arrived)
+            else:
+                frames_arrived_list.append(0.0)
 
         is_day_changed = False
         processing_reward = {}
@@ -165,6 +175,7 @@ class BaseEnvironment(ParallelEnv):
         overflow_reward = {}
         battery_reward = {}
         threshold_reward = {}
+        real_processed_images = {}
         for agent_id in range(0, self._num_agents):
             processing_reward[agent_id] = 0
             offloading_reward[agent_id] = 0
@@ -188,16 +199,18 @@ class BaseEnvironment(ParallelEnv):
         offloaded_images_dict = {i: 0 for i in range(0, self._num_agents)}
         received_images_dict = {i: 0 for i in range(0, self._num_agents)}
         for agent_id in range(0, self._num_agents):
-            
+            fti = actions[agent_id][0]
             hard_threshold_energy = self.battery_capacities[agent_id] * self.battery_hard_threshold
             if self.battery_hard_threshold > 0 and self.battery_energies[agent_id] <= hard_threshold_energy:
-                actions[agent_id] = [0, 0, agent_id, 0]
+                #actions[agent_id] = [0, 0, agent_id, 0]
                 actual_battery_percentage = self.battery_energies[agent_id] / self.battery_capacities[agent_id]
-                battery_reward[agent_id] = -1 / (actual_battery_percentage + 1e-6)
+                a = actual_battery_percentage / self.battery_hard_threshold
+                #battery_reward[agent_id] = (-1 / (actual_battery_percentage + 1e-6))*self.battery_reward_weight
+                battery_reward[agent_id] = self.battery_reward_weight*(-1 / ((actual_battery_percentage / self.battery_hard_threshold) + 1e-6))
+                fti = 0
             else:
                 battery_reward[agent_id] = 0
             
-            fti = actions[agent_id][0]
             irradiance_level = self.get_irradiance_level(self.day, self.daily_timestamp, agent_id)
             panel_energy = irradiance_level * self.max_irrad * self.panel_surfaces[agent_id] * self._proc_interval * self.panel_efficiency
             #print("Panel energy for agent", agent_id, ":", panel_energy)
@@ -211,6 +224,7 @@ class BaseEnvironment(ParallelEnv):
             processed_images = fti * self._proc_interval
             max_processed_images = self._processing_rate * self._proc_interval
             processed_images = min(processed_images, self.backlogs[agent_id])
+            real_processed_images[agent_id] = processed_images / max_processed_images
             needed_energy = (processed_images * self.e_frame) + self.e_idle
 
             backlog_loss_weight = self.backlog_loss_weight
@@ -259,27 +273,46 @@ class BaseEnvironment(ParallelEnv):
                 needed_energy = offloaded_images * self.e_tx_rx # * self._proc_interval
                 self.tx_energy_consumed += needed_energy
                 offload_step_reward = 0
-                if self.battery_energies[agent_id] > needed_energy:
+                if self.battery_energies[agent_id] > needed_energy and self.battery_energies[target] > needed_energy:
                     self.backlogs[agent_id] = max(self.backlogs[agent_id] - offloaded_images, 0)
                     self.backlogs[target] += offloaded_images
                     offload_step_reward = offloaded_images
+                    self.offloaded_images_counter[agent_id][target] += offloaded_images
                 else: # Not enough energy to transmit
                     offload_step_reward = -offloaded_images
                 self.battery_energies[agent_id] = max(self.battery_energies[agent_id] - needed_energy, 0)
+                self.battery_energies[target] = max(self.battery_energies[target] - needed_energy, 0)
 
                 # self.offload_weight < processing_weight to prioritize local processing over offloading, and vice versa
                 offloading_reward[agent_id] += self.offloading_weight * offload_step_reward / (self._processing_rate)
-        
-                offloading_reward[agent_id] -= (self.offloading_weight/2)*self.tx_energy_consumed / (self.e_tx_rx * self._processing_rate * self._num_agents)
+                target_quality = self.gossip_memory[agent_id][target]['battery'] * (1- self.gossip_memory[agent_id][target]['backlog'])
+                local_quality = (self.battery_energies[agent_id]/self.battery_capacities[agent_id]) * (1 - (self.backlogs[agent_id] / (self.max_storage)))
+                offloading_reward[agent_id] *= (target_quality - local_quality - 0.1) #tsp 60
+                #battery_quality = self.gossip_memory[agent_id][target]['battery'] - (self.battery_energies[agent_id] / self.battery_capacities[agent_id])
+                #backlog_quality = self.gossip_memory[agent_id][target]['backlog'] - (self.backlogs[agent_id] / self.max_storage)
+                #offloading_reward[agent_id] *= (0.5*battery_quality + 0.5*backlog_quality)
+                #offloading_reward[agent_id] -= (self.offloading_weight/2)*self.tx_energy_consumed / (self.e_tx_rx * self._processing_rate * self._num_agents)
         
         #Penalize buffer overflow
         for agent_id in range(0, self._num_agents):
-            buffer_fill = self.backlogs[agent_id] / (self.max_storage + 1e-6)
-            overflow_reward[agent_id] = ((self.overflow_weight**buffer_fill) - 1)/(self._processing_rate)
-            if self.backlogs[agent_id] > self.max_storage:
-                #backlog_difference = self.backlogs[agent_id] - self.max_storage
-                #overflow_reward[agent_id] = (-backlog_difference*self.overflow_weight)/(self._processing_rate * self._proc_interval)
-                self.backlogs[agent_id] = self.max_storage
+            #buffer_fill = self.backlogs[agent_id] / (self.max_storage + 1e-6)
+            #overflow_reward[agent_id] = ((self.overflow_weight**buffer_fill) - 1)/(self._processing_rate)
+            backlog_ratio = self.backlogs[agent_id] / self.max_storage
+            #overflow_reward[agent_id] = 1/((1-backlog_ratio)+1e-6)
+            #if self.backlogs[agent_id] > self.max_storage:
+            if False:
+                if backlog_ratio > 0.8:
+                    overflow_reward[agent_id] = -1/((1-backlog_ratio)+1e-6)
+                else:
+                    overflow_reward[agent_id] = 0
+                self.backlogs[agent_id] = min(self.backlogs[agent_id], self.max_storage)
+            else:
+                if self.backlogs[agent_id] > self.max_storage:
+                    backlog_difference = self.backlogs[agent_id] - self.max_storage
+                    overflow_reward[agent_id] = -backlog_difference*self.overflow_weight / (self._processing_rate * self._proc_interval)
+                    self.backlogs[agent_id] = self.max_storage
+                else:
+                    overflow_reward[agent_id] = 0
 
             # battery_capacity = self.battery_capacities[agent_id]
             # battery_ratio = self.battery_energies[agent_id] / (battery_capacity + 1e-6)
@@ -333,9 +366,12 @@ class BaseEnvironment(ParallelEnv):
         obs = self.gen_obs()
         
         infos = {}
+        max_frames_arrived = 2.0 * self._arrival_rate * self._proc_interval if self.variable_arrival_rate else self._arrival_rate * self._proc_interval
         for a in self.agents:
             panel_energy = self.get_irradiance_level(self.day, self.daily_timestamp, a) * self.max_irrad * self.panel_surfaces[a] * self._proc_interval * self.panel_efficiency
             panel_energy /= self.max_irrad * self.panel_surfaces[a] * self.panel_efficiency * self._proc_interval
+            # Normalize frames_arrived to [0, 1]
+            frames_arrived_norm = frames_arrived_list[a] / max_frames_arrived if max_frames_arrived > 0 else 0.0
             infos[a] = {
                 "panel_energy": panel_energy,
                 "processed_frames": self.fs[a]/(self._processing_rate * self.max_day_steps),
@@ -347,6 +383,8 @@ class BaseEnvironment(ParallelEnv):
                 "battery_reward": battery_reward[a],
                 "threshold_reward": threshold_reward[a],
                 "is_day_changed": is_day_changed,
+                "frames_arrived_norm": frames_arrived_norm,
+                "real_processed_images": real_processed_images[a],
             }
             #print(f"Reward for agent {a}: processing {processing_reward[a]:.4f}, offloading {offloading_reward[a]:.4f}, overflow {overflow_reward[a]:.4f}, battery {battery_reward[a]:.4f}")
 
@@ -366,6 +404,7 @@ class BaseEnvironment(ParallelEnv):
         reset_fields = options is not None and options.get('reset_fields', False)
         self.is_evaluation = is_evaluation
         self.tx_energy_consumed = 0.0
+        self.offloaded_images_counter = [[0 for i in range(0, self._num_agents)] for j in range(0, self._num_agents)]
 
         # First episode always starts from a clean state.
         # During evaluation we keep the previous day's battery/backlog.
@@ -386,7 +425,10 @@ class BaseEnvironment(ParallelEnv):
 
         # Persistent peer selection: each node selects a fixed set of peers
         # Number of peers defaults to self.gossip_peers (set from constructor)
-        k = min(self.gossip_peers, self._num_agents - 1)
+        if self.gossip_peers == 0:
+            k = ceil(2 * log(self._num_agents) + 3)
+        else:
+            k = min(self.gossip_peers, self._num_agents - 1)
         self.peers = {}
         for a in self.agents:
             others = [j for j in self.agents if j != a]
@@ -501,6 +543,28 @@ class BaseEnvironment(ParallelEnv):
             ])
         
         return np.array(features, dtype=np.float32)
+
+    def get_frames_arrived(self, agent_id: int) -> float:
+        """Return the number of frames arriving at this timestep.
+        When variable_arrival_rate is enabled the arrival rate follows a
+        sinusoidal pattern with a 2-hour period, oscillating between 0 and
+        2 * base_arrival_rate.  Otherwise, it returns the constant rate."""
+        if not self.variable_arrival_rate:
+            return self._arrival_rate * self._proc_interval
+        # Sinusoidal modulation: (1 + sin(2π·t / period)) maps to [0, 2]
+        phase = (2.0 * np.pi * self.daily_timestamp / self._arrival_period_steps)
+        phase += (agent_id * 2.0 * np.pi / self._num_agents)  # phase shift per agent for diversity
+        modulation = 1.0 + np.sin(phase)  # range [0, 2]
+        return modulation * self._arrival_rate * self._proc_interval
+
+    def get_frames_arrived_norm(self, agent_id: int) -> float:
+        """Return the normalized frames_arrived in [0, 1]."""
+        fa = self.get_frames_arrived(agent_id)
+        if self.variable_arrival_rate:
+            max_fa = 2.0 * self._arrival_rate * self._proc_interval
+        else:
+            max_fa = self._arrival_rate * self._proc_interval
+        return fa / max_fa if max_fa > 0 else 0.0
 
     def get_irradiance_level(self, day:int , dayly_timestamp:int , agent_id:int) -> float:
         idx = ((day * self.max_day_steps) + dayly_timestamp) % len(self.irradiance_arrays[agent_id])

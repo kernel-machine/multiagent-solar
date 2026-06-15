@@ -11,23 +11,9 @@ from custom_environment import CustomEnvironment
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from sb3_mas_train import SB3_MAS_Train
 
-irradiance_datapaths = [
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv',
-    '../../../../../dataset/csv_41.89109712745386_12.503566993103867_fixed_23_180_PT15M_2024.csv'
-    ]
-
 delta_time = 15 * 60
 proc_interval = 5 * 60
 proc_rate = 30
-arrival_rate = 15
 
 eps_init = 1.0
 eps_fin = 0.05
@@ -47,44 +33,18 @@ eps_dec = 0.9985
 # battery_capacities = [25, 100, 50, 37]
 # panel_surfaces = [1.0, 0.5, 0.75, 0.85]
 
-batt_moliplicator_factor = 0.3
+batt_moliplicator_factor = 0.5
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
 battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
 
-panel_moltiplicator_factor = 0.3
-panel_surfaces = [1.0, 0.5, 0.75, 0.85, 0.65, 0.55, 0.90, 0.60, 0.80, 0.55]
+panel_moltiplicator_factor = 1
+panel_surfaces = [0.45, 0.4, 0.50, 0.35, 0.4, 0.275, 0.35, 0.3, 0.5, 0.275]
 panel_surfaces = [p * panel_moltiplicator_factor for p in panel_surfaces]
 
-# num_agents = 10
-# battery_capacities = [
-#     25, 
-#     100,  
-#     50,   
-#     37,   
-#     65,   
-#     80,   
-#     40,   
-#     75,   
-#     55,   
-#     90    
-# ]
+irradiance_datapaths = ['../../../../../dataset/solcast2024_filtered.csv' for i in range(len(panel_surfaces))]
 
-# panel_surfaces = [
-#     1.00,  
-#     0.50,  
-#     0.75,  
-#     0.85,  
-#     0.65,  
-#     0.55,  
-#     0.90,  
-#     0.60,  
-#     0.80,  
-#     0.52   
-# ]
-
-
-power_idle = 2.6
-power_max = 6.0
+power_idle = 2.8
+power_max = 8
 
 w = 1.0
 
@@ -125,7 +85,7 @@ if __name__ == "__main__":
     parser.add_argument("--lstm-prediction-demo", action="store_true", help="Like --lstm-prediction but uses real future GHI data instead of LSTM predictions (oracle baseline).")
     parser.add_argument("--net-width", type=int, default=64, help="Width (neurons) of each hidden layer in the policy/value networks (default: 64).")
     parser.add_argument("--net-layers", type=int, default=2, help="Number of hidden layers in the policy/value networks (default: 2).")
-    parser.add_argument("--eval-days", type=int, default=1, help="Number of days to simulate during final evaluation (default: 1).")
+    parser.add_argument("--eval-days", type=int, default=7, help="Number of days to simulate during final evaluation (default: 1).")
     parser.add_argument("--train-days", type=int, default=1, help="Number of days per training episode (default: 1). Higher values teach agents to conserve battery across day boundaries.")
     parser.add_argument("--seed", type=str, default="random", help="Seed scenario for weather scenario selector (options: fixed_winter, fixed_summer, linear, random).", choices=["fixed_winter", "fixed_summer", "linear", "random"])
     parser.add_argument("--rng-seed", type=int, default=1234, help="RNG seed for PyTorch, NumPy, and environment PRNG.")
@@ -138,6 +98,10 @@ if __name__ == "__main__":
     parser.add_argument("--unprocessed-images-weight", type=float, default=1.0, help="Unprocessed images weight penalty multiplier (default: 1.0).")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate the trained agent.")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor gamma for RL algorithms (default: 0.995).")
+    parser.add_argument("--variable-arrival-rate", action="store_true", help="Enable time-varying frame arrival rate with a sinusoidal 2-hour period.")
+    parser.add_argument("--arrival-rate", type=int, default=15, help="Base frame arrival rate (default: 20)")
+    parser.add_argument("--battery-reward-weight", type=float, default=1.0, help="Battery reward weight reward multiplier (default: 1.0).")
+    parser.add_argument("--max-buffer-steps", type=int, default=30, help="Number of steps worth of arrivals to consider as max buffer for battery reward calculation (default: 30).")
     args = parser.parse_args()
 
     if args.lstm_prediction and args.lstm_prediction_demo:
@@ -160,7 +124,7 @@ if __name__ == "__main__":
         delta_time,
         proc_interval,
         proc_rate,
-        arrival_rate,
+        args.arrival_rate,
         battery_capacities,
         panel_surfaces,
         power_idle,
@@ -189,7 +153,10 @@ if __name__ == "__main__":
         backlog_loss_weight=args.backlog_loss_weight,
         survival_bonus=args.survival_bonus,
         processed_images_weight=args.processed_images_weight,
-        unprocessed_images_weight=args.unprocessed_images_weight
+        unprocessed_images_weight=args.unprocessed_images_weight,
+        battery_reward_weight=args.battery_reward_weight,
+        variable_arrival_rate=args.variable_arrival_rate,
+        max_buffer_steps=args.max_buffer_steps
     )
 
     # Extend training episodes to span multiple days
@@ -229,6 +196,9 @@ if __name__ == "__main__":
     elif args.lstm_prediction_demo:
         suffix += "_lstm_prediction_demo"
 
+    if args.variable_arrival_rate:
+        suffix += "_var_arrival"
+
     if args.train_days > 1:
         suffix += f"_{args.train_days}days"
 
@@ -238,6 +208,7 @@ if __name__ == "__main__":
         + suffix
         + f"/{args.num_agents}agents"
         + f"lstm_{args.lstm_prediction or args.lstm_prediction_demo}"
+        + f"variable_{args.variable_arrival_rate}"
     )
 
     trainer1 = SB3_MAS_Train(
@@ -247,7 +218,7 @@ if __name__ == "__main__":
         delta_time,
         proc_interval,
         proc_rate,
-        arrival_rate,
+        args.arrival_rate,
         eps_init,
         eps_fin,
         eps_dec,

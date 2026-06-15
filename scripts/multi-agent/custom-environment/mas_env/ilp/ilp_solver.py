@@ -23,7 +23,8 @@ class SB3_MAS_Train:
             processing_days: int = 1,
             initial_backlog: int = 0,
             initial_energy: float = 0.5,
-            days_to_process: int = 1):
+            days_to_process: int = 1,
+            variable_arrival_rate: bool = False):
     
         self.num_agents = num_agents
         self.irradiance_datapaths = irradiance_datapaths
@@ -39,6 +40,7 @@ class SB3_MAS_Train:
         self.power_idle = power_idle
         self.power_max = power_max
         self.w = w
+        self.variable_arrival_rate = variable_arrival_rate
 
         self.e_idle = power_idle * self.proc_interval_s
         self.e_frame = (0.8 * (power_max - power_idle) * 1) / proc_rate
@@ -48,18 +50,42 @@ class SB3_MAS_Train:
         self.irradiance_arrays = []
         # Battery starts at 50% of its capacity
         day = processing_days
+        # Track the original (real) timestep index for each filtered entry
+        # so that variable arrival rate uses the correct time-of-day phase.
+        self._real_timestep_indices = []
         for filepath in self.irradiance_datapaths:
             # print(filepath, delta_time, proc_interval)
             df = ip.interpolate(filepath, delta_time, proc_interval)
             self.irradiance_data.append(df)
-            values = df['ghi'].values[day*24*60//5:(day+days_to_process)*24*60//5]
-            values = list(filter(lambda x: x > 0, values))
+            all_values = df['ghi'].values[day*24*60//5:(day+days_to_process)*24*60//5]
+            # Keep only sunny timesteps but remember their original indices
+            real_indices = [idx for idx, v in enumerate(all_values) if v > 0]
+            values = [all_values[idx] for idx in real_indices]
             self.irradiance_arrays.append(values)
+            self._real_timestep_indices.append(real_indices)
 
         N = self.num_agents
         T = len(self.irradiance_arrays[0])
 
-        A = np.full((N, T), self.arrival_rate * self.proc_interval_s)
+        if self.variable_arrival_rate:
+            # Sinusoidal modulation matching base_envirionment.py:
+            # period = 2 hours expressed in timesteps
+            arrival_period_steps = int(2 * 3600 / self.proc_interval_s)
+            A = np.empty((N, T))
+            real_indices = self._real_timestep_indices[0]
+            for i in range(N):
+                for t in range(T):
+                    # Use the real (unfiltered) timestep so the sinusoidal
+                    # phase matches the RL environment's daily_timestamp.
+                    real_t = real_indices[t]
+                    phase = (2.0 * np.pi * real_t / arrival_period_steps)
+                    phase += (i * 2.0 * np.pi / N)  # per-agent phase shift
+                    modulation = 1.0 + np.sin(phase)  # range [0, 2]
+                    # Round to int: frames are discrete objects
+                    A[i, t] = int(modulation * self.arrival_rate * self.proc_interval_s)
+        else:
+            A = np.full((N, T), self.arrival_rate * self.proc_interval_s)
+        self.A = A
         x = cp.Variable((N, N, T), nonneg=True, integer=True)
         B = cp.Variable((N, T+1), nonneg=True)
         E = cp.Variable((N, T+1))
@@ -67,6 +93,8 @@ class SB3_MAS_Train:
         # SLACK REMOVED — forces strict E >= 0 like RL environment
         # slack = cp.Variable((N, T), nonneg=True)
         y = cp.Variable((N, N, T), boolean=True) # Unicast transmission indicator
+        # active[i,t] = 1 if agent i is operational at timestep t (has enough battery)
+        active = cp.Variable((N, T), boolean=True)
         
         self.Eharv = np.array(self.irradiance_arrays) # (N, T)
         self.Eharv = np.array([e[:T] for e in self.Eharv])
@@ -84,14 +112,15 @@ class SB3_MAS_Train:
         # Hard physical limit (battery energy cannot be negative)
         constraints += [E <= np.array(self.battery_capacities_wh).reshape(-1, 1) * 3600]
 
-        # Soft safety threshold constraint (15% capacity, matching the 0.15 threshold in the RL environment)
-        battery_threshold_ratio = 0.001
-        min_E = np.array(self.battery_capacities_wh).reshape(-1, 1) * 3600 * battery_threshold_ratio
-        constraints += [E >= min_E]
+        # Battery cannot go below 0
+        constraints += [E >= 0]
 
         # Set upper bound for x
         UB = self.proc_rate * self.proc_interval_s
         constraints += [x <= UB]
+
+        # Big-M for energy-activity link
+        E_max = np.array(self.battery_capacities_wh) * 3600  # max battery in Joules
 
         for t in range(T):
             out_i = []
@@ -109,6 +138,14 @@ class SB3_MAS_Train:
                     if i != j:
                         constraints += [ x[i, j, t] <= UB * y[i, j, t] ]
 
+                # --- Device shutdown logic ---
+                # If active[i,t]=1, agent must have at least e_idle energy
+                constraints += [ E[i, t] >= self.e_idle * active[i, t] ]
+                # If active[i,t]=0, no local processing
+                constraints += [ x[i, i, t] <= UB * active[i, t] ]
+                # If active[i,t]=0, no outgoing transmissions
+                constraints += [ out_i[i] <= UB * active[i, t] ]
+
                 # same-slot availability
                 constraints += [
                     x[i, i, t] + out_i[i] <= B[i, t] + A[i, t] + in_i[i]
@@ -125,9 +162,9 @@ class SB3_MAS_Train:
                 ]
 
                 panel_energy_j = self.Eharv[i, t] * self.proc_interval_s * self.panel_surfaces[i] * 0.2
-                # Energy conservation WITHOUT slack — strict E >= 0
+                # Energy conservation: idle consumption only when active
                 constraints += [
-                    E[i, t+1] == E[i, t] + panel_energy_j - self.e_idle
+                    E[i, t+1] == E[i, t] + panel_energy_j - self.e_idle * active[i, t]
                     - self.e_frame * x[i, i, t]
                     - self.e_tx_rx * (out_i[i] + in_i[i])
                     - spill[i, t]
@@ -137,7 +174,7 @@ class SB3_MAS_Train:
         tx_total = cp.sum([x[i, j, k] for i in range(N) for j in range(N) if j != i for k in range(T)])
 
         SPILL_PENALTY = 1e-3
-        EPSILON_OBJ = 1e-6
+        EPSILON_OBJ = 1e-3
 
         #SLACK_PENALTY = 100.0  # Strongly penalize dropping below 15% safety threshold
 
@@ -148,6 +185,7 @@ class SB3_MAS_Train:
             #- SLACK_PENALTY * cp.sum(slack)
         )
         self.x = x
+        self.active = active
         self.prob = cp.Problem(objective, constraints)
         self.battery = E
         self.buffer = B
@@ -156,9 +194,9 @@ class SB3_MAS_Train:
     def solve(self):
         self.prob.solve(verbose=True,
             solver=cp.HIGHS,
-            time_limit=60,
+            #time_limit=120,
             random_seed=1234,
-            threads=1)
+            threads=6)
         
         print("Status:", self.prob.status)
         print("Optimal value:", self.prob.value)
@@ -170,7 +208,7 @@ class SB3_MAS_Train:
             print(f"No plottable solution (status: {self.prob.status}).")
             return
 
-        plt.figure(figsize=(12, 24))
+        plt.figure(figsize=(12, 18))
         for agent_id in range(self.num_agents):
             plt.subplot(self.num_agents, 1, agent_id + 1)
 
@@ -189,11 +227,15 @@ class SB3_MAS_Train:
 
             # Tx frames to nodes different from itself
             tx_total = np.array([ np.sum(self.x[agent_id, :, t].value) - self.x[agent_id, agent_id, t].value for t in range(len(self.irradiance_arrays[0]))])
-            ax1.plot(tx_total / (self.proc_rate * self.proc_interval_s), label='Frames Transmitted', color='tab:green')
+            ax1.plot(tx_total / (self.proc_rate * self.proc_interval_s), label='Frames Transmitted', color='tab:green', alpha=0.5)
             
             # Rx frames from nodes different from itself
             rx_total = np.array([ np.sum(self.x[:, agent_id, t].value) - self.x[agent_id, agent_id, t].value for t in range(len(self.irradiance_arrays[0]))])
-            ax1.plot(rx_total / (self.proc_rate * self.proc_interval_s * self.num_agents), label='Frames Received', color='tab:cyan')
+            ax1.plot(rx_total / (self.num_agents * self.proc_rate * self.proc_interval_s), label='Frames Received', color='tab:cyan', alpha=0.5)
+
+            # Arrival images
+            max_arrival = (2.0 if self.variable_arrival_rate else 1.0) * self.arrival_rate * self.proc_interval_s
+            ax1.plot(self.A[agent_id, :] / max_arrival, label='Arrival Rate', color='tab:brown', alpha=1)
             
             # Limita l'asse Y per evitare che i picchi enormi schiaccino la linea a 0.75
             ax1.set_ylim(-0.05, 1.05)
@@ -203,5 +245,6 @@ class SB3_MAS_Train:
             plt.grid()
         plt.tight_layout()
         plt.savefig('ilp_solution.png')
-        plt.show()
+        plt.savefig('ilp_solution.pdf')
+        #plt.show()
 

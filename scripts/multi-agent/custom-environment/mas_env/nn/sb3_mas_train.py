@@ -1020,11 +1020,11 @@ class SB3_MAS_Train:
         # Evaluation should reflect the final safe behavior: stop on battery depletion.
         obs, _ = self.eval_env.reset(seed=self.seed, options={'evaluate': use_eval_reset, "reset_fields": True})
         print(f"Evaluating on episode {self.eval_env.day} (seed='{self.seed}', days={eval_days})")
-        agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloaded_images": [], "received_images": [], "reward": []} for agent_id in range(self.num_agents)}
+        agents_logs = {agent_id: {"battery": [], "processing": [], "panel_energy": [], "backlog": [], "state": [], "processed_frames": [], "hs_counter": [], "offloaded_images": [], "received_images": [], "reward": [], "frames_arrived": []} for agent_id in range(self.num_agents)}
         total_rewards = {i: 0 for i in range(self.num_agents)}
         episode_ends = []
         step = 0
-        days = 7
+        days = eval_days
         while days > 0:
             actions = {}
             for agent_id in range(self.num_agents):
@@ -1043,11 +1043,12 @@ class SB3_MAS_Train:
                 # print(f"Agent {agent_id} - State: {obs[agent_id][2]})")
                 agents_logs[agent_id]["battery"].append(obs[agent_id][1])
                 agents_logs[agent_id]["panel_energy"].append(obs[agent_id][0])
-                agents_logs[agent_id]["processing"].append(actions[agent_id][0]/self.proc_rate)
+                agents_logs[agent_id]["processing"].append(infos[agent_id]["real_processed_images"])
                 agents_logs[agent_id]["backlog"].append(obs[agent_id][2])
                 agents_logs[agent_id]["reward"].append(rewards[agent_id])
                 agents_logs[agent_id]["offloaded_images"].append(infos[agent_id]["offloaded_images"])
                 agents_logs[agent_id]["received_images"].append(infos[agent_id]["received_images"])
+                agents_logs[agent_id]["frames_arrived"].append(infos[agent_id].get("frames_arrived_norm", 0.0))
 
             for agent_id in range(self.num_agents):
                 if infos[agent_id].get("is_day_changed", False):
@@ -1060,7 +1061,13 @@ class SB3_MAS_Train:
                 break
 
             obs = next_obs
-                
+
+        for row in self.eval_env.offloaded_images_counter:
+            print(row)
+
+        for agent_id in range(self.num_agents):
+            print(f"Peers {agent_id}: {list(self.eval_env.peers[agent_id])}")
+
         # Build time axis in hours
         num_steps_recorded = len(agents_logs[0]['battery'])
         hours = np.arange(num_steps_recorded) * (self.proc_interval / 3600.0)
@@ -1077,6 +1084,8 @@ class SB3_MAS_Train:
             plt.vlines(episode_ends, ymin=0, ymax=1, color='green', linestyle='--', linewidth=0.8, alpha=0.9)
             plt.plot(hours, agents_logs[agent_id]['offloaded_images'], label='Offloaded Images')
             plt.plot(hours, agents_logs[agent_id]['received_images'], label='Received Images')
+            if any(v > 0 for v in agents_logs[agent_id]['frames_arrived']):
+                plt.plot(hours, agents_logs[agent_id]['frames_arrived'], label='Frames Arrived', alpha=0.7)
 
             # Color area when battery is 0
             threshold = 0
@@ -1086,7 +1095,7 @@ class SB3_MAS_Train:
                             where=(np.array(agents_logs[agent_id]['battery']) <= threshold), 
                             color='red', alpha=0.2, label='Battery Depleted')
        
-            plt.title(f'Agent {agent_id} Evaluation ({eval_days} day{"s" if eval_days > 1 else ""})')
+            plt.title(f'Agent {agent_id}')
             plt.xlabel('Time (hours)')
             plt.ylabel('Value')
             plt.legend(loc='upper left', fontsize='small')
@@ -1096,6 +1105,9 @@ class SB3_MAS_Train:
         file_name = os.path.join(self.log_dir, file_name)
         print("Saved in ", file_name)
         plt.savefig(file_name, dpi=150)
+        file_name = file_name.replace(".png", ".pdf")
+        plt.savefig(file_name, dpi=150)
+
         plt.close() 
 
         print("Total processed frames during evaluation:", self.eval_env.total_frames_processed)

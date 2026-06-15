@@ -17,7 +17,6 @@ def interpolate(path, delta, target):
     new_index = pd.date_range(start=start, end=end, freq=f'{target}min')
 
     df_interpol = df.reindex(new_index)
-    df_interpol['dni'] = round(df_interpol['dni'].interpolate(method='linear'), 2)
-    df_interpol['ghi'] = df_interpol['ghi'].interpolate(method='linear')
+    df_interpol['gti'] = df_interpol['gti'].interpolate(method='linear')
     
     return df_interpol
