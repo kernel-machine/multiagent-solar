@@ -75,7 +75,7 @@ if __name__ == "__main__":
     parser.add_argument("--random-nodes", type=int, default=0, help="Insert the battery and backlog values of X randomly selected nodes into the state.")
     parser.add_argument("--gossip", action="store_true", help="Enable gossip mechanism for information sharing.")
     parser.add_argument("--gossip-interval", type=int, default=5, help="Number of steps between gossip communications.")
-    parser.add_argument("--gossip-peers", type=int, default=2, help="Number of fixed peers each node selects at start for gossip.")
+    parser.add_argument("--gossip-peers", type=int, default=0, help="Number of fixed peers each node selects at start for gossip.")
     parser.add_argument("--gossip-state-nodes", type=int, default=3, help="Number of nodes to include in the state from gossip memory.")
     parser.add_argument("--gossip-order", type=str, choices=["priority", "timestamp"], default=None, help="Criterio di ordinamento della gossip memory (priority=utility, timestamp=most recent first)")
     parser.add_argument("--backlog-buckets", type=int, default=3, help="Number of backlog buckets stored per agent (use 1 for a single backlog value).")

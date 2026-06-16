@@ -208,7 +208,7 @@ class SB3_MAS_Train:
             print(f"No plottable solution (status: {self.prob.status}).")
             return
 
-        plt.figure(figsize=(12, 18))
+        plt.figure(figsize=(12, 12))
         for agent_id in range(self.num_agents):
             plt.subplot(self.num_agents, 1, agent_id + 1)
 
