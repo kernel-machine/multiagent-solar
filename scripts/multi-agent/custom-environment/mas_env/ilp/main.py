@@ -24,7 +24,7 @@ eps_fin = 0.05
 # eps_dec = 0.999
 eps_dec = 0.9985
 
-num_agents = 3
+num_agents = 5
 batt_moliplicator_factor = 0.5
 battery_capacities = [50, 100, 50, 60, 65, 80, 50, 55, 90, 70]
 battery_capacities = [b * batt_moliplicator_factor for b in battery_capacities]
