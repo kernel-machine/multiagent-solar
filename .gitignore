@@ -7,3 +7,4 @@ env
 scripts/multi-agent/custom-environment/mas_env/runs/*
 scripts/multi-agent/custom-environment/mas_env/models/*
 scripts/multi-agent/custom-environment/mas_env/nn/tb_logs/*
+**/__pycache__
